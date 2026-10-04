@@ -76,16 +76,29 @@ uncertainty on the baseline.
 
 ![Residual patching](figures/resid_patching.png)
 
-Clean `resid_pre` is patched into the corrupt run at one (layer, position) at a time (template 0 only, so that
-positions line up).
+Clean `resid_pre` is patched into the corrupt run at one (layer, position) at a time. This uses template 0 only, so
+that positions line up, with ABBA and BABA plotted separately because the IO and S1 slots swap between them. Each
+panel is normalized by its own clean and corrupt LD. Values above 1 mean the patch does *better* than the clean run.
 
-- **As expected**, the information arrives at the final token (`to`) in layers 8–10. By layer 10, patching that
-  single position restores the full clean behaviour.
-- **An artifact of the corruption:** patching the S2 position (`Robert`) in early layers gives strongly *negative*
-  values (about −0.9). This is not part of the circuit. Patching the early residual stream at S2 puts the token
-  `Robert` into a context where it appears only once. The model copies names that appear in context, so it boosts
-  `Robert`, which is the S token in the metric. ABC changes two things at once (the repetition *and* the name
-  tokens), which confounds patching at name positions. An ABB → ABA corruption, which flips which name is
+- **The answer reaches the final token (`to`) at layers 9–10, and overshoots.** Patching that position does nothing
+  before layer 8, recovers 0.1–0.2 at layers 8–9, then jumps to **1.62 (ABBA) / 1.53 (BABA)** at layer 10. The
+  overshoot is copy suppression ([§4](#4-direct-logit-attribution)) failing to engage. The patched state carries
+  "Susan" from the name movers, but the negative name movers 10.7 and 11.10 suppress a name by attending to it in the
+  context, and the corrupt context contains no Susan. The brake that costs the clean run about 3 logits has nothing
+  to grip. At layer 11 (1.33 / 1.50), 10.7's braking is already in the patched state and only 11.10's is missing.
+- **Single name positions carry the largest effects, ±1.1 to 1.5.** Patching the IO slot puts the IO name into the
+  corrupt context once, and the model copies it, a large positive effect. Patching S1 does the same for S, a large
+  negative one. Both fade at layers 10–11, after the name movers have read those positions. *(An earlier version of
+  this plot averaged ABBA with BABA, which cancelled these effects to about 0.)*
+- **The S2 column traces the circuit's timing.** Patching S2 (the repeated name) is strongly negative in early layers
+  (about −0.6), fades to about 0 by layers 6–7, is negative again at layers 8–10, and fades at layer 11. My reading:
+  early on, the patch inserts only the *token* S, appearing once, which the model copies. By layers 5–7 the patched
+  state also carries the "this name is a repeat" flag written by the duplicate-token and induction heads, which the
+  S-inhibition heads (layers 7–8) read and use to steer the name movers away from S. From layer 8 on, the flag
+  arrives after the S-inhibition heads have already read that position, but the token is still there for the name
+  movers (layers 9–10) to copy. This interpretation fits the layer timing but is not directly tested.
+- **This is partly an artifact of the corruption.** ABC changes two things at once (the repetition *and* the name
+  tokens), so patching a name position also inserts a name. An ABB → ABA corruption, which flips which name is
   repeated while keeping the same names, would isolate the repetition cue (see [Next steps](#next-steps)).
 
 ### 3. Per-head patching
@@ -107,7 +120,13 @@ Each head's clean output is patched into the corrupt run (denoising).
 
 The circuit's output heads reproduce. Two observations:
 
-- **Recoveries are not additive.** The top five entries alone sum to 1.65.
+- **In this experiment, a late head's patching effect equals its direct effect.** Across all 144 heads, the patching
+  value and the direct effect divided by the clean − corrupt gap (§4) have correlation 0.998 (e.g. 9.9: 0.87 vs 0.84;
+  10.7: −0.62 vs −0.60). Summed with signs over all heads, the patching values come to 0.84, roughly additive. The
+  reason: the corrupt context contains neither IO nor S, so downstream heads have nothing to copy or suppress, and
+  nothing reacts to the patch. Denoising into this context measures each head's direct contribution, not the network's
+  response. Contrast §5, where the same heads are ablated in the clean context and the network compensates almost
+  completely (mean-ablating 9.9 alone drops LD by only 0.34 [0.23, 0.44]).
 - **Denoising measures sufficiency, not necessity.** The S-inhibition heads barely register here, yet ablating them
   in the clean run drops LD by 3.0 (§6). Their output means "don't attend to S", which does nothing in a corrupt
   run where IO and S never appear. The circuit behaves like an AND gate, so a head can be essential without being
