@@ -1,0 +1,29 @@
+# IOI + the Hydra effect in GPT-2 small
+
+One-day project: reproduce the IOI circuit (Wang et al. 2022, arXiv:2211.00593) with TransformerLens 4.x,
+then measure self-repair (McGrath et al. 2023, "The Hydra Effect", arXiv:2307.15771) when the name-mover
+heads are ablated, with bootstrap CIs and ablation-method / template / seed systematics.
+
+## Setup
+
+    source setup.sh
+
+The first time, this creates `.venv`, installs `requirements.txt` (including TransformerLens, pinned to
+a git commit), and registers the `ioi-hydra` Jupyter kernel. After that it just activates the venv and sets `PATH` (`scripts/`) and
+`PYTHONPATH` (`python/`). To rebuild from scratch: `rm -rf .venv && source setup.sh`.
+
+## Run
+
+    jupyter lab notebooks/ioi_hydra.ipynb    # interactive; use the "Python (ioi-hydra)" kernel
+    run-notebook                             # headless; executed copy goes to results/
+
+About 4 minutes end to end on CPU on an M4.
+
+## Layout
+
+    python/ioi_hydra.py         helpers: dataset, patching, direct effects, ablations, bootstrap
+    notebooks/ioi_hydra.ipynb   the analysis
+    scripts/run-notebook        headless execution
+
+Note: TransformerLens 4.0 removed `HookedTransformer`. Load models with
+`TransformerBridge.boot_transformers("gpt2")`, then call `enable_compatibility_mode()`.

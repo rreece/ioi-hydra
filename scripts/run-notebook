@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Execute a notebook headlessly and write the executed copy to results/.
+#     run-notebook                        # runs notebooks/ioi_hydra.ipynb
+#     run-notebook notebooks/other.ipynb
+set -euo pipefail
+: "${PROJECT_PATH:?source setup.sh first}"
+nb="${1:-${PROJECT_PATH}/notebooks/ioi_hydra.ipynb}"
+mkdir -p "${PROJECT_PATH}/results"
+jupyter nbconvert --to notebook --execute "${nb}" \
+    --ExecutePreprocessor.kernel_name=ioi-hydra \
+    --ExecutePreprocessor.timeout=1800 \
+    --output-dir "${PROJECT_PATH}/results"
