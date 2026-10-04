@@ -53,8 +53,31 @@ Normalized LD rescales this so that corrupt = 0 and clean = 1.
 - **mean**: its mean over the corrupt prompts of the same template, per position (as in Wang et al.)
 - **resample**: its value on the matched corrupt prompt
 
-**Direct effect (DE)** of a head is its output at the final position, passed through the final LayerNorm (using
-that run's own scale) and projected onto W_U[IO] − W_U[S].
+**Direct effect (DE)** of a component is how far its output, on its own, pushes the IO logit above the S logit. It
+is defined as follows. At the final position, the residual stream entering the final LayerNorm is a sum of
+everything written into it:
+
+$$x = \text{embeddings} + \sum_{\text{heads } h} o_h + \sum_{\text{MLPs } m} o_m + \text{biases}, \qquad o_h = z_h W_O^{h}$$
+
+where $z_h$ is head $h$'s output (`hook_z`) at the final position and $W_O^{h}$ its output projection. With
+compatibility mode, the LayerNorm weight and bias are folded into $W_U$ and $b_U$, so the final LayerNorm is just
+centering and scaling:
+
+$$\text{LN}(x) = \frac{x - \bar{x}}{\sigma(x)}, \qquad \text{logits} = \text{LN}(x)\, W_U + b_U$$
+
+where $\bar{x}$ is the mean over the 768 dimensions and $\sigma(x)$ the LayerNorm scale. Writing
+$\Delta w = W_U[:, \text{IO}] - W_U[:, \text{S}]$, the logit difference is
+
+$$LD = \frac{(x - \bar{x}) \cdot \Delta w}{\sigma(x)} + (b_U[\text{IO}] - b_U[\text{S}])$$
+
+Centering is linear, so for a fixed $\sigma$ this splits exactly into one term per component:
+
+$$LD = \sum_{c} DE_c + (b_U[\text{IO}] - b_U[\text{S}]), \qquad DE_c = \frac{(o_c - \bar{o}_c) \cdot \Delta w}{\sigma(x)}$$
+
+Every component shares the same denominator $\sigma(x)$, taken from the run being analysed (clean or ablated). The
+*direct* effect counts only the path straight to the logits; a component that changes the answer by changing what
+later components do has an indirect effect that DE does not see. Implemented in `head_direct_effects` in
+[`python/ioi_hydra.py`](../python/ioi_hydra.py).
 
 ## Results
 
