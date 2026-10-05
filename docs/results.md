@@ -286,6 +286,27 @@ interaction term they can be badly wrong, in either direction.
 
 ![Direct vs total by ablation method](figures/direct_vs_total.png)
 
+**Reading the figure.** The blue bar (direct) is the drop LD would show if nothing else in the network reacted:
+the answer the three name movers were writing, minus what their replacement values write. It is the null hypothesis
+of no compensation. The red bar (total) is the drop that actually happens, and the gap between them is the repair.
+The blue bars are the same height for all three methods (4.54–4.57) because none of the replacements carries
+information about IO vs S: the ablated heads' DE falls to about 0 in every case, so direct ≈ DE<sub>9.9</sub> +
+DE<sub>9.6</sub> + DE<sub>10.0</sub> = 2.89 + 1.12 + 0.53. The blue bar is therefore effectively a fixed reference, and
+the result is that the red bar is about 0 however the heads are removed.
+
+In control-systems terms:
+
+| | control-systems term | here |
+|---|---|---|
+| **direct** (blue) | open-loop response: feedback switched off | −4.6 logits |
+| **total** (red) | closed-loop response: feedback on | about 0 |
+| **repair fraction** | how well the feedback regulates | about 1.0: complete regulation |
+
+The brake releasing and the backups stepping up (§5) are the feedback. One limit: the blue bar counts only the name
+movers' *direct* path to the logits. For heads in layers 9–10 whose job is writing the answer, that is most of their
+effect, but the precise no-feedback prediction would freeze every downstream activation at its clean value before
+ablating.
+
 | variation | repair fraction |
 |---|---|
 | ablation method: zero / mean / resample | 1.06 [1.02, 1.10] / 1.03 [1.00, 1.07] / 1.00 [0.96, 1.04] |
@@ -342,6 +363,7 @@ most informative: redundancy for the name movers, routing for the S-inhibition h
 ## Next steps
 
 - Freeze the final-LN scale to split repair into head compensation and LayerNorm rescaling.
+- Freeze all downstream activations before ablating, for an exact no-feedback prediction to compare with the direct effect (§7).
 - Repeat §2–§3 with an ABB → ABA corruption.
 - Use path patching to find *how* 10.7 and the backup heads detect that the name movers are missing.
 - Repeat on Pythia or Gemma-2-2B.
