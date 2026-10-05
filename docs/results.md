@@ -320,6 +320,65 @@ patching means (§2).
 
 ## Conclusions
 
+1. **The IOI circuit's output stage reproduces in TransformerLens 4.x.** This is a replication of Wang et al.'s
+   circuit, not a new discovery. Baseline LD is 3.38 (Wang et al.: ~3.55), and the same late heads come out in the
+   same roles: name movers 9.9, 9.6, 10.0; negative name movers 10.7, 11.10; backups in layer 10. The answer reaches
+   the final position at layers 9–10. The S-inhibition heads are confirmed as necessary but their mechanism is not
+   examined, and the early duplicate-detection heads are not tested directly (§1–§4, §6). What the mechanism computes
+   is closer to "predict the name in context that isn't repeated" than to grammatical indirect-object detection: in
+   §2, a single name inserted into the corrupt prompt is copied whatever its grammatical role. In these templates the
+   two coincide.
+2. **The answer is a balance of opposing forces.** The name movers write about +4.5 logits toward the IO name;
+   copy-suppression heads attending to the same name write about −3.3. The output is a small difference between
+   large terms. When the brake has nothing to grip, as in the corrupt context of §2, the model overshoots the clean
+   run by 50–60% (§2, §4).
+3. **Self-repair is complete, robust, and done by attention heads.** Removing 4.6 logits of direct effect costs
+   nothing: repair fraction 1.03 [1.00, 1.07], holding across ablation methods, templates and name samples. About
+   45% is the brake 10.7 releasing and 55% is backups doubling their attention to the IO name, slightly offset by
+   11.10 tightening; MLPs, biases and LayerNorm together contribute −0.03 (§5, §7).
+4. **A component's importance depends on the question and on what else is present.** Direct effect, denoising and
+   ablation disagree, in opposite directions for the name movers and the S-inhibition heads (tables below). Heads
+   also interact through redundancy, dependency and saturation: removing the two brakes (10.7, 11.10) raises LD by
+   about 2.5 logits with the name movers present, but by only about 1.0 once the name movers are gone. Credit assignment is therefore order-dependent; Shapley values are the
+   principled alternative (§6).
+5. **The measurement design shapes what is found.** With an ABC corruption, per-head denoising reduces to direct
+   logit attribution (r = 0.998), and patching a name position inserts a token rather than restoring structure.
+   Normalized scores above 1 revealed an inhibitory process; a clipped colour scale and ABBA/BABA averaging had hidden
+   the largest effects. Templates move the baseline far beyond statistical error but not the repair fraction, and
+   the seed-to-seed spread matches the bootstrap error (§1–§3, §7).
+6. **Implications for interpretability practice.** Report direct and total effects together, report several
+   counterfactuals and treat their spread as a systematic, and measure interactions before trusting any "component X
+   explains Y%" decomposition. An automated agent ranking components by single-head ablation would call the name
+   movers unimportant, so self-repair is a built-in failure mode for automated interpretability unless direct and
+   total effects are compared. The same applies to steering or suppressing features: downstream compensation means
+   effects should be measured end to end.
+
+### Interpreting the repair
+
+A circuit is usually presented as *the* pathway for a behaviour, yet removing its main output heads leaves the
+behaviour unchanged. The data resolve this as follows:
+
+- **The decision is not redundant; the output stage is.** Removing the S-inhibition heads, which carry which name is
+  repeated, drops LD by 3.05 to near chance, and nothing repairs it. Removing the name movers, which write the
+  answer, costs nothing. The network has one path for the computation and many paths for the output.
+- **"Name mover" is a role, not a head.** At least seven heads (9.9, 9.6, 10.0, 10.10, 10.6, 10.2, 10.1) can attend to
+  the non-repeated name and copy it. Normally 9.9 does most of the work; when it is removed, the others roughly
+  double their attention to the IO name. The circuit is better described as a graph of roles, each filled by a pool
+  of heads of different strengths (degeneracy, in biological terms), than as a list of specific heads.
+- **The output is regulated, not just computed.** The copy-suppression heads act as negative feedback on the
+  predicted name's logit, plausibly for calibration. When the name movers stop pushing, the brake eases off, which
+  accounts for about 45% of the repair. Robustness to ablation may be a side effect of this calibration rather than
+  something selected for directly. What causes the redundancy in training (dropout is one hypothesis) is not
+  addressed here.
+
+This is where Wang et al.'s criteria for a circuit (faithful, complete, minimal) come apart: a circuit without the
+backups looks complete until the name movers are ablated. Any method that judges a component's importance by
+removing it will misjudge the output stage.
+
+**What this study does not establish:** whether repair is this complete in larger models; *why* the backup heads'
+attention increases; exactly how much of the repair is LayerNorm rescaling; or what an ABB → ABA corruption would
+show (see [Caveats](#caveats) and [Next steps](#next-steps)).
+
 ### Sufficiency vs necessity
 
 The sections use two kinds of intervention, plus one that is neither:
