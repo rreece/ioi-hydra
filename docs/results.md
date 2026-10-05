@@ -25,6 +25,14 @@ then asked how much the rest of the network compensates when the heads that writ
 matter. Both readings are wrong; what matters is how the rest of the network responds. Any automated or
 single-method assessment of "how important is this component" needs to measure that response.
 
+The three tools used here answer different questions:
+
+| tool | question | for the name movers |
+|---|---|---|
+| **direct effect** (DLA, §4) | who's *voting* for the answer? | they cast most of the votes |
+| **denoising** (patching, §2–§3) | who's *enough* to bring it back? | they're enough on their own |
+| **ablation** (§5–§7) | who's *needed*? | they aren't: others change their votes |
+
 All uncertainties are 95% percentile-bootstrap intervals over prompts (5000 resamples). *N* = 128 prompts.
 
 ## Setup
@@ -259,9 +267,17 @@ Mean ablation (zero and resample agree to within about 0.3; see the notebook):
 | head set | Σ single drops | joint drop | interaction | interpretation |
 |---|---|---|---|---|
 | name movers | 0.10 [−0.06, 0.27] | −0.15 [−0.33, 0.02] | +0.26 [0.18, 0.33] | each one fully backed up, alone or together |
-| name movers + negative NMs | −2.45 [−2.70, −2.19] | −1.18 [−1.41, −0.95] | **−1.26** [−1.41, −1.11] | **dependency**: ablating 10.7 alone *raises* LD by about 3, but with the name movers gone it has nothing left to suppress |
+| name movers + negative NMs | −2.45 [−2.70, −2.19] | −1.18 [−1.41, −0.95] | **−1.26** [−1.41, −1.11] | **dependency**: the two brakes ablated one at a time *raise* LD by about 2.55 (= −2.45 − 0.10), but with the name movers gone 10.7 has already released (§5) and removing it adds little |
 | name movers + backup NMs | 0.43 [0.24, 0.62] | 1.58 [1.29, 1.90] | **−1.16** [−1.37, −0.95] | **redundancy**: damage appears only when the backups are removed together |
 | S-inhibition | 3.65 [3.34, 3.96] | 3.05 [2.82, 3.27] | +0.60 [0.48, 0.73] | **saturation**: LD can only fall so far |
+
+The three kinds of interaction:
+
+| kind | signature | example | intuition |
+|---|---|---|---|
+| **redundancy** | joint > Σ singles | name movers + backups | spare capacity: each part is covered until you remove them all |
+| **dependency** | one effect is conditional on another | name movers + brakes | the brake only acts when there's something to brake |
+| **saturation** | joint < Σ singles | S-inhibition | a floor: you can't lose more than everything |
 
 Single-factor or sequential decompositions of a network's behaviour depend on order and context. Without the
 interaction term they can be badly wrong, in either direction.
