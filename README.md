@@ -1,7 +1,7 @@
 # IOI + the Hydra effect in GPT-2 small
 
-One-day project: reproduce the Indirect Object Identification (IOI) circuit in GPT-2 small (Wang et al. 2022, arXiv:[2211.00593](https://arxiv.org/abs/2211.00593)),
-then measure self-repair (McGrath et al. 2023, "The Hydra Effect", arXiv:[2307.15771](https://arxiv.org/abs/2307.15771))
+One-day project: reproduce the Indirect Object Identification (IOI) circuit in GPT-2 small ([Wang et al. 2022](https://arxiv.org/abs/2211.00593)),
+then measure self-repair ([McGrath et al. 2023, "The Hydra Effect"](https://arxiv.org/abs/2307.15771))
 when the name-mover heads are ablated, with bootstrap CIs and ablation-method / template / seed systematics.
 
 **Results: [docs/results.md](docs/results.md).** Headline: ablating the three name-mover heads removes 4.6 logits
