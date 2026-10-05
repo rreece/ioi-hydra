@@ -192,6 +192,17 @@ remove one side, and the other can ease off.
 
 ![Change in direct effect](figures/hydra_delta_de.png)
 
+Each cell of the figure is the change in that head's direct effect when the name movers are ablated, in logits and
+averaged over prompts:
+
+$$\Delta DE_h = DE_h^{\text{ablated}} - DE_h^{\text{clean}}$$
+
+Blue means the head pushes LD up more than before, red that it pushes LD down more, white that it is unchanged. The
+colour shows the *change*, not the contribution itself: 10.7 is blue because it goes from −2.06 to +0.07, that is, it
+stops braking. Heads in layers 0–9 run before or alongside the ablated heads, so they are white by construction
+(apart from the shared LayerNorm scale); only layers 10–11 can respond. Summed over all heads, the cells give the
+change in LD up to a small remainder (see the full accounting below).
+
 Mean-ablate the name movers {9.9, 9.6, 10.0}. If the network were a sum of independent parts, LD would fall by the
 direct effect those heads lose. What actually happens:
 
