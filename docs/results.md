@@ -8,7 +8,9 @@ see [Reproducing](#reproducing).*
 GPT-2 small completes *"When Susan and Robert went to the store, Robert gave a drink to"* with *Susan*, using a
 circuit found by [Wang et al. 2022](https://arxiv.org/abs/2211.00593). I replicated it with TransformerLens 4.x and
 asked what happens when the heads that write the answer are removed
-([McGrath et al. 2023, "The Hydra Effect"](https://arxiv.org/abs/2307.15771)).
+([McGrath et al. 2023, "The Hydra Effect"](https://arxiv.org/abs/2307.15771)). That this circuit self-repairs was
+already known; what is new here is a complete, uncertainty-quantified accounting of the repair (see
+[Relation to prior work](#relation-to-prior-work)).
 
 **Result.** Ablating the three name-mover heads removes 4.6 logits of direct effect, yet the logit difference does
 not drop: the network repairs **103% [100%, 107%]** of the damage. This holds for zero, mean and resample ablation,
@@ -37,6 +39,34 @@ the order of removal. Claims about component importance should report direct and
 counterfactuals, and interactions.
 
 All uncertainties are 95% percentile-bootstrap intervals over prompts (5000 resamples). *N* = 128 prompts.
+
+## Relation to prior work
+
+This study is a replication with quantitative extensions, not a new discovery. What each source contributes:
+
+| work | setting | relevant finding |
+|---|---|---|
+| [Wang et al. 2022](https://arxiv.org/abs/2211.00593) | GPT-2 small, IOI | the circuit; backup name movers, found because knocking out the name movers did not break the task; negative name movers, which they speculate help the model "hedge" |
+| [McGrath et al. 2023](https://arxiv.org/abs/2307.15771) | factual recall, ablating whole attention layers | the Hydra effect: when one attention layer is ablated, another compensates; late MLPs "downregulate the maximum-likelihood token"; this occurs "even in language models trained without any form of dropout" |
+| [McDougall et al. 2023](https://arxiv.org/abs/2310.04625) | GPT-2 small, head 10.7 | copy suppression; "if an initial overconfident copier is ablated, then there is nothing to suppress"; copy suppression "explains 39% of the [self-repair] behavior in a narrow task" |
+
+**What is borrowed.** The circuit and its head roles come from Wang et al. The central measurement, direct versus
+total effect of an ablation with the gap read as compensation, comes from McGrath et al., applied here at the level of
+individual heads inside the IOI circuit rather than whole layers in a factual-recall setting. That the IOI circuit
+self-repairs (Wang et al.) and that 10.7 contributes by having nothing left to suppress (McDougall et al.) were both
+already known.
+
+**What this study adds.**
+1. A complete accounting of the repair with uncertainties: every logit assigned to a component (§5 waterfall), with
+   bootstrap CIs. The 45% attributed to 10.7 is consistent with McDougall et al.'s 39%, measured on a different
+   dataset with different accounting.
+2. The counter-push from the later brake 11.10, which partly undoes the repair (§5).
+3. Systematics: the repair fraction across ablation methods, templates and name samples, with the bootstrap errors
+   checked against seed-to-seed variation (§7).
+4. A measured taxonomy of head interactions (redundancy, dependency, saturation) with paired CIs (§6).
+5. Methodological observations: with an ABC corruption, per-head denoising reduces to direct logit attribution
+   (§3); normalized patching scores above 1 reveal an inhibitory process (§2); and plotting choices such as a clipped
+   colour scale or averaging ABBA with BABA can hide the largest effects (§2).
 
 ## Setup
 
@@ -212,8 +242,6 @@ head's OV circuit and unembedded: this is what the head would write if it attend
 Wang et al., the copy score is the fraction of prompts where the IO token is among the 5 highest of all 50,257
 logits, and the negative copy score the fraction where it is among the 5 lowest.
 
-![Copy scores](figures/copy_scores.png)
-
 | head | role | copy score | negative copy score | attention END → IO | DE |
 |---|---|---|---|---|---|
 | 9.9 | name mover | **1.00** | 0.00 | 0.77 | +2.89 |
@@ -313,6 +341,7 @@ Three mechanisms are visible (see also the attention figure in §4):
 1. **The brake releases (10.7), about 45% of the repair.** Copy suppression attends to the name currently being
    predicted and pushes it down. Without the name movers, Susan is not strongly predicted when layer 10 runs, so
    10.7 stops attending to her and its suppression vanishes. This is the same mechanism as the overshoot in §2.
+   McDougall et al. attribute 39% of self-repair to copy suppression in their narrow task, consistent with 45% here.
 2. **The backups step up, about 55%.** Each backup roughly doubles its attention to the IO name, and its direct
    effect doubles with it. *Why* their attention increases is not shown by these measurements; path patching would
    test whether the name movers' output normally dampens the backups' queries.
@@ -381,6 +410,23 @@ Near-complete self-repair is robust to every choice that could plausibly have br
 most over-repair, consistent with it pushing activations furthest off-distribution. The choices that *do*
 matter are the template, which moves the baseline LD (§1), and the corruption, which changes what position-level
 patching means (§2).
+
+**Why vary the ablation method.** "Remove a head" always means "replace its output with something", and each choice
+asks a different counterfactual question. Self-repair is a claim about how downstream heads *react*, which is exactly
+the kind of result an unnatural replacement could fake: downstream heads might respond to the unnaturalness of the
+input rather than to the missing information. The repair fraction held across all three methods.
+
+**Not yet varied**, roughly in order of expected importance:
+
+| systematic | why it could matter |
+|---|---|
+| the corruption behind mean and resample ablation (ABC) | it defines what "no information" means; an ABB → ABA corruption could change the reference values |
+| which positions are ablated (all positions vs the final token only) | name movers act at the final token; ablating everywhere also changes what they write elsewhere |
+| which heads count as name movers | including 10.10 or 10.6 changes what is left to compensate (§6 shows this matters) |
+| the LayerNorm-scale convention in DE | could shift credit between heads; freezing the scale would settle it |
+| the metric (LD vs log-probability of IO) | LD cancels the softmax denominator; probabilities would behave differently |
+| the bootstrap (over prompts vs over templates, then prompts) | a hierarchical bootstrap would give wider, more honest intervals |
+| the model | whether repair is this complete in other sizes or training runs is the biggest open question |
 
 ## Conclusions
 
