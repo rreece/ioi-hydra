@@ -7,6 +7,9 @@ when the name-mover heads are ablated, with bootstrap CIs and ablation-method / 
 **Results: [docs/results.md](docs/results.md).** Headline: ablating the three name-mover heads removes 4.6 logits
 of direct effect, but the logit difference doesn't drop; the network repairs 103% (+4/−3%) of the damage.
 
+![Self-repair in GPT-2 small’s IOI circuit.](docs/figures/repair_waterfall.png)
+
+
 ## Setup
 
     source setup.sh
@@ -15,12 +18,14 @@ The first time, this creates `.venv`, installs `requirements.txt` (including Tra
 a git commit), and registers the `ioi-hydra` Jupyter kernel. After that it just activates the venv and sets `PATH` (`scripts/`) and
 `PYTHONPATH` (`python/`). To rebuild from scratch: `rm -rf .venv && source setup.sh`.
 
+
 ## Run
 
     jupyter lab notebooks/ioi_hydra.ipynb    # interactive; use the "Python (ioi-hydra)" kernel
     run-notebook                             # headless; executed copy goes to results/
 
 About 4 minutes end to end on CPU on an M4.
+
 
 ## Layout
 
