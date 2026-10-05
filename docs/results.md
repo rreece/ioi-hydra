@@ -5,33 +5,36 @@ see [Reproducing](#reproducing).*
 
 ## Summary
 
-GPT-2 small completes *"When Susan and Robert went to the store, Robert gave a drink to"* with *Susan*, using a known
-circuit ([Wang et al. 2022](https://arxiv.org/abs/2211.00593)). I reproduced that circuit with TransformerLens 4.x and
-then asked how much the rest of the network compensates when the heads that write the answer are removed
+GPT-2 small completes *"When Susan and Robert went to the store, Robert gave a drink to"* with *Susan*, using a
+circuit found by [Wang et al. 2022](https://arxiv.org/abs/2211.00593). I replicated it with TransformerLens 4.x and
+asked what happens when the heads that write the answer are removed
 ([McGrath et al. 2023, "The Hydra Effect"](https://arxiv.org/abs/2307.15771)).
 
-- **Ablating the three name-mover heads removes 4.6 logits of direct effect, but the model's logit difference does
-  not drop at all** (−0.15 ± 0.2). The network repairs **103% (+4/−3%)** of the damage.
-- About **45%** of the repair is the negative name mover **10.7 releasing its brake**: it normally pushes the
-  answer down by 2.1 logits and goes quiet when the name movers are gone. The other **55%** comes from **backup name
-  movers** (10.10, 10.2, 11.2, 10.6, 10.1) stepping up.
-- **Head interactions are large and come in both signs**: redundancy (the joint effect exceeds the sum of single
-  effects), dependency (one head's effect depends on another), and saturation (the sum of single effects
-  exceeds the joint effect).
-- The headline holds across **ablation method** (zero / mean / resample), **8 prompt templates**, and **4 dataset
-  seeds**.
+**Result.** Ablating the three name-mover heads removes 4.6 logits of direct effect, yet the logit difference does
+not drop: the network repairs **103% [100%, 107%]** of the damage. This holds for zero, mean and resample ablation,
+across 8 templates and 4 name samples.
 
-**Takeaway.** Judged by direct logit attribution, the name movers carry 4.5 logits. Judged by ablation, they don't
-matter. Both readings are wrong; what matters is how the rest of the network responds. Any automated or
-single-method assessment of "how important is this component" needs to measure that response.
+**Mechanism.** The answer is a small difference between large opposing forces: the name movers push the correct name
+up by about 4.5 logits while copy-suppression heads push it down by about 3.3. When the name movers are removed, the
+brake (head 10.7) lets go, giving about 45% of the repair, and backup heads double their attention to the answer,
+giving the other 55%. Attention heads account for all of it.
 
-The three tools used here answer different questions:
+**Interpretation.** The circuit has an irreplaceable *decision* stage and a redundant, self-regulating *output*
+stage. Removing the S-inhibition heads, which carry which name is repeated, drops the logit difference to near chance
+with no repair. "Name mover", by contrast, is a role filled by a pool of heads, with negative feedback holding the
+output steady.
+
+**Lesson.** Direct effect, patching and ablation answer different questions, and here they disagree:
 
 | tool | question | for the name movers |
 |---|---|---|
 | **direct effect** (DLA, §4) | who's *voting* for the answer? | they cast most of the votes |
 | **denoising** (patching, §2–§3) | who's *enough* to bring it back? | they're enough on their own |
 | **ablation** (§5–§7) | who's *needed*? | they aren't: others change their votes |
+
+Heads also interact (redundancy, dependency, saturation), so any "component X explains Y%" decomposition depends on
+the order of removal. Claims about component importance should report direct and total effects, several
+counterfactuals, and interactions.
 
 All uncertainties are 95% percentile-bootstrap intervals over prompts (5000 resamples). *N* = 128 prompts.
 
