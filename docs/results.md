@@ -192,8 +192,49 @@ sufficient on its own.
 | 11.10 | −0.92 [−1.01, −0.82] | 0.62 | 0.09 |
 | 10.7 | **−2.06** [−2.20, −1.92] | **0.81** | 0.05 |
 
-The name movers attend to the IO name and copy it, raising the IO logit. The negative name movers attend to the
-*same* token and push it down. This is copy suppression ([McDougall et al. 2023](https://arxiv.org/abs/2310.04625)).
+The name movers attend to the IO name and raise the IO logit. The negative name movers attend to the *same* token
+and push it down. This is copy suppression ([McDougall et al. 2023](https://arxiv.org/abs/2310.04625)). Two further
+checks establish what "name mover" means: that these heads *copy* the name they read, and where they look.
+
+**Copying.** For each head, the residual stream at the IO position, as the head reads it, is passed through the
+head's OV circuit and unembedded: this is what the head would write if it attended fully to the IO name. Following
+Wang et al., the copy score is the fraction of prompts where the IO token is among the 5 highest of all 50,257
+logits, and the negative copy score the fraction where it is among the 5 lowest.
+
+![Copy scores](figures/copy_scores.png)
+
+| head | role | copy score | negative copy score | attention END → IO | DE |
+|---|---|---|---|---|---|
+| 9.9 | name mover | **1.00** | 0.00 | 0.77 | +2.89 |
+| 9.6 | name mover | 0.90 | 0.00 | 0.67 | +1.12 |
+| 10.0 | name mover | 0.74 | 0.00 | 0.37 | +0.53 |
+| 10.10 | backup | 0.52 | 0.00 | 0.33 | +0.55 |
+| 10.6 | backup | 0.62 | 0.00 | 0.35 | +0.39 |
+| 10.2 | backup | 1.00 | 0.00 | 0.20 | +0.01 |
+| 10.1 | backup | 0.09 | 0.00 | 0.31 | +0.16 |
+| 11.2 | backup | 0.92 | 0.00 | 0.08 | −0.30 |
+| 10.7 | brake | 0.00 | **0.98** | 0.81 | −2.06 |
+| 11.10 | brake | 0.00 | **1.00** | 0.62 | −0.92 |
+
+The name movers and most backups copy; the two brakes anti-copy, writing the name they read as its most
+*suppressed* token. Copying alone does not make a name mover: 6.9, 7.2, 7.10 and 8.11 also have copy scores above
+0.9 but do not attend to the IO name from the final token, so they never write it there. A name mover is the
+combination of attending to IO from the final position and copying what it reads. 11.2 illustrates this: it copies
+(0.92) but attends slightly more to S1 than to IO, so its net direct effect is negative. 10.1 is the exception among
+the backups: it attends to IO but has a low copy score (0.09), so this test does not explain its positive direct
+effect.
+
+**Attention.** Where each head looks from the final token, in the clean run and with the name movers mean-ablated
+(§5). The ablated heads are hatched in the right panel because their outputs are replaced and they write nothing.
+9.9's and 9.6's attention is unchanged by the ablation; 10.0's rises from 0.37 to 0.64 because it reads layer 9's
+output.
+
+![Attention from the final token](figures/attention.png)
+
+In the clean run, the name movers and brakes attend mainly to IO, and the backups attend to IO more weakly. With the
+name movers removed, every backup roughly doubles its attention to IO (10.10: 0.33 → 0.62, 10.1: 0.31 → 0.56), while
+the brake 10.7 drops from 0.81 to 0.28 and spreads its attention to S1 and S2. This is the repair mechanism of §5,
+seen directly in where the heads look.
 
 **The output is a small difference between large opposing terms.** The three name movers contribute +4.5
 directly, more than the total LD of 3.4; the negative heads subtract about 3. This sets up the self-repair below:
@@ -247,7 +288,7 @@ about 6% (17.8 → 16.6), which slightly inflates every head's DE, but the remai
 | 10.1 | +0.24 [0.19, 0.28] | +0.16 → +0.40 | 0.31 → 0.56 | backup steps up |
 | 11.10 | **−0.27** | −0.92 → −1.19 | 0.62 → 0.67 | the later brake tightens |
 
-Three mechanisms are visible:
+Three mechanisms are visible (see also the attention figure in §4):
 
 1. **The brake releases (10.7), about 45% of the repair.** Copy suppression attends to the name currently being
    predicted and pushes it down. Without the name movers, Susan is not strongly predicted when layer 10 runs, so
@@ -364,8 +405,8 @@ behaviour unchanged. The data resolve this as follows:
 - **The decision is not redundant; the output stage is.** Removing the S-inhibition heads, which carry which name is
   repeated, drops LD by 3.05 to near chance, and nothing repairs it. Removing the name movers, which write the
   answer, costs nothing. The network has one path for the computation and many paths for the output.
-- **"Name mover" is a role, not a head.** At least seven heads (9.9, 9.6, 10.0, 10.10, 10.6, 10.2, 10.1) can attend to
-  the non-repeated name and copy it. Normally 9.9 does most of the work; when it is removed, the others roughly
+- **"Name mover" is a role, not a head.** At least seven heads (9.9, 9.6, 10.0, 10.10, 10.6, 10.2, 11.2) attend to
+  the non-repeated name and copy it (copy score ≥ 0.5, §4). Normally 9.9 does most of the work; when it is removed, the others roughly
   double their attention to the IO name. The circuit is better described as a graph of roles, each filled by a pool
   of heads of different strengths (degeneracy, in biological terms), than as a list of specific heads.
 - **The output is regulated, not just computed.** The copy-suppression heads act as negative feedback on the

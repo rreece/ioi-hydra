@@ -255,6 +255,43 @@ def attention_to(cache, ds: IOIDataset, layer: int, head: int, to: str, frm: str
     return pattern[b, head, ds.pos[frm], ds.pos[to]].float().cpu()
 
 
+def attention_profile(cache, ds: IOIDataset, heads) -> dict:
+    """Mean attention from the final token to IO, S1, S2 and everything else, for each head.
+    Returns {(layer, head): {"IO": float, "S1": float, "S2": float, "other": float}}."""
+    out = {}
+    for l, h in heads:
+        prof = {k: attention_to(cache, ds, l, h, k).mean().item() for k in ("IO", "S1", "S2")}
+        prof["other"] = 1.0 - sum(prof.values())
+        out[(l, h)] = prof
+    return out
+
+
+def copy_scores(model, cache, ds: IOIDataset, k: int = 5):
+    """Does each head copy the name it attends to?
+
+    For every head, take the residual stream at the IO position as that head reads it (after its
+    layer's LayerNorm), pass it through the head's OV circuit (W_V, W_O), centre it as the final
+    LayerNorm would, and unembed. This is what the head would write if it attended fully to the IO
+    name. Following Wang et al., the copy score is the fraction of prompts where the IO token is
+    among the k highest logits (over the whole vocabulary), and the negative copy score the fraction
+    where it is among the k lowest.
+
+    Returns (copy, negative_copy), each [n_layers, n_heads]."""
+    b = torch.arange(len(ds))
+    L, H = model.cfg.n_layers, model.cfg.n_heads
+    copy, neg = torch.zeros(L, H), torch.zeros(L, H)
+    io = ds.io.to(model.W_U.device)
+    for l in range(L):
+        x = cache[f"blocks.{l}.ln1.hook_normalized"][b, ds.pos["IO"]]  # [N, d_model]
+        for h in range(H):
+            v = x @ model.W_V[l, h] + model.b_V[l, h]  # [N, d_head]
+            out = v @ model.W_O[l, h]  # [N, d_model]
+            logits = (out - out.mean(-1, keepdim=True)) @ model.W_U  # [N, d_vocab]
+            copy[l, h] = (logits.topk(k, dim=-1).indices == io[:, None]).any(-1).float().mean()
+            neg[l, h] = ((-logits).topk(k, dim=-1).indices == io[:, None]).any(-1).float().mean()
+    return copy, neg
+
+
 # ---------------------------------------------------------------------------------------------
 # Ablations
 # ---------------------------------------------------------------------------------------------
