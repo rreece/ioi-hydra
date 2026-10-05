@@ -28,7 +28,7 @@ output steady.
 
 | tool | question | for the name movers |
 |---|---|---|
-| **direct effect** (DLA, §4) | who's *voting* for the answer? | they cast most of the votes |
+| **direct effect on the logits** (DLA, §4) | who's *voting* for the answer? | they cast most of the votes |
 | **denoising** (patching, §2–§3) | who's *enough* to bring it back? | they're enough on their own |
 | **ablation** (§5–§7) | who's *needed*? | they aren't: others change their votes |
 
@@ -64,8 +64,10 @@ Normalized LD rescales this so that corrupt = 0 and clean = 1.
 - **mean**: its mean over the corrupt prompts of the same template, per position (as in Wang et al.)
 - **resample**: its value on the matched corrupt prompt
 
-**Direct effect (DE)** of a component is how far its output, on its own, pushes the IO logit above the S logit. It
-is defined as follows. At the final position, the residual stream entering the final LayerNorm is a sum of
+**Direct effect on the logits (DE)** of a component is how far its output, on its own, pushes the IO logit above
+the S logit, through the direct path to the unembedding only. Throughout this document "DE" always means the direct
+effect *on the logits*. (Wang et al. use "direct effect" relative to any receiver: the logits in their Fig 3b, the name
+movers' queries in Fig 4b, the S-inhibition heads' values in Fig 5b.) It is defined as follows. At the final position, the residual stream entering the final LayerNorm is a sum of
 everything written into it:
 
 $$x = \text{embeddings} + \sum_{\text{heads } h} o_h + \sum_{\text{MLPs } m} o_m + \text{biases}, \qquad o_h = z_h W_O^{h}$$
@@ -177,11 +179,20 @@ in the clean run drops LD by 3.0 (§6). Their output means "don't attend to S", 
 where IO and S never appear. The circuit behaves like an AND gate, so a head can be essential without being
 sufficient on its own.
 
-### 4. Direct logit attribution
+### 4. Direct logit attribution (direct effect on the logits)
 
 ![Direct effects](figures/direct_effects.png)
 
-| head | DE on LD | attention END → IO | attention END → S1 |
+**Comparison with Wang et al. Fig 3b.** That figure measures the same quantity with the opposite sign and different
+units. It patches each head's direct path to the logits with its ABC activation in a clean run and plots the
+resulting *change* in LD, as a percentage of clean LD. Since a head's direct effect in the ABC run is about 0 (§3),
+
+$$\text{Fig 3b} \approx \frac{DE_h^{\text{ABC}} - DE_h^{\text{clean}}}{LD^{\text{clean}}} \approx -\frac{DE_h^{\text{clean}}}{LD^{\text{clean}}}$$
+
+So name movers are positive here and negative in Fig 3b (e.g. 10.0: +0.53 logits here, about −16% there), and the
+negative name movers the reverse. The same heads stand out in both.
+
+| head | DE (logits) | attention END → IO | attention END → S1 |
 |---|---|---|---|
 | 9.9 | **+2.89** [2.71, 3.07] | 0.77 | 0.07 |
 | 9.6 | +1.12 [1.00, 1.25] | 0.67 | 0.12 |
@@ -275,6 +286,15 @@ direct effect those heads lose. What actually happens:
 
 The repair comes almost entirely from attention heads changing their outputs. The final LayerNorm scale drops by
 about 6% (17.8 → 16.6), which slightly inflates every head's DE, but the remainder after the heads is only −0.03.
+
+The same accounting as a waterfall, with the other heads split by mechanism. It starts at the clean LD, steps down by
+what the name movers lose, and steps back up through each response to the ablated LD:
+
+![Repair waterfall](figures/repair_waterfall.png)
+
+The brake releasing (+2.13) and the backups stepping up (+2.45: 10.10, 10.2, 11.2, 10.6, 10.1) together more than
+replace the name movers' −4.57. The later brake 11.10 takes back 0.27, the remaining heads add 0.44, and MLPs,
+biases and LayerNorm change it by −0.03, ending at 3.53, slightly above the clean 3.38.
 
 **Which heads respond**, with the change in their attention from the final token to the IO name:
 
