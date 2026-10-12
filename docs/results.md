@@ -82,9 +82,9 @@ GPT-2 token.
 | **clean** (BABA) | When **Jessica** and **Alice** went to the store, **Jessica** gave a drink to | Alice |
 | **corrupt** (ABC) | When **Anthony** and **Betty** went to the store, **Thomas** gave a drink to | — |
 
-Each clean prompt is paired with a corrupt prompt built from the same template, with all three name slots
-replaced by fresh, distinct names. The corrupt prompt keeps the grammar, length and token positions, but removes
-the one cue IOI depends on (which name is repeated). It is the control sample for patching and ablation.
+Each clean prompt is paired with a corrupt prompt from the same template, with all three name slots replaced by
+fresh, distinct names. It keeps the grammar, length and token positions but removes the one cue IOI depends on
+(which name is repeated), making it the control sample for patching and ablation.
 
 **Metric.** Logit difference LD = logit(IO) − logit(S) at the final token, always using the clean pair's IO and S.
 Normalized LD rescales this so that corrupt = 0 and clean = 1.
@@ -95,10 +95,10 @@ Normalized LD rescales this so that corrupt = 0 and clean = 1.
 - **resample**: its value on the matched corrupt prompt
 
 **Direct effect on the logits (DE)** of a component is how far its output, on its own, pushes the IO logit above
-the S logit, through the direct path to the unembedding only. Throughout this document "DE" always means the direct
-effect *on the logits*. (Wang et al. use "direct effect" relative to any receiver: the logits in their Fig 3b, the name
-movers' queries in Fig 4b, the S-inhibition heads' values in Fig 5b.) It is defined as follows. At the final position, the residual stream entering the final LayerNorm is a sum of
-everything written into it:
+the S logit through the direct path to the unembedding. "DE" here always means the direct effect *on the logits*;
+Wang et al. use "direct effect" relative to any receiver (the logits in their Fig 3b, the name movers' queries in
+Fig 4b, the S-inhibition heads' values in Fig 5b). At the final position, the residual stream entering the final
+LayerNorm is a sum of everything written into it:
 
 $$x = \text{embeddings} + \sum_{\text{heads } h} o_h + \sum_{\text{MLPs } m} o_m + \text{biases}, \qquad o_h = z_h W_O^{h}$$
 
@@ -117,10 +117,9 @@ Centering is linear, so for a fixed $\sigma$ this splits exactly into one term p
 
 $$LD = \sum_{c} DE_c + (b_U[\text{IO}] - b_U[\text{S}]), \qquad DE_c = \frac{(o_c - \bar{o}_c) \cdot \Delta w}{\sigma(x)}$$
 
-Every component shares the same denominator $\sigma(x)$, taken from the run being analysed (clean or ablated). The
-*direct* effect counts only the path straight to the logits; a component that changes the answer by changing what
-later components do has an indirect effect that DE does not see. Implemented in `head_direct_effects` in
-[`python/ioi_hydra.py`](../python/ioi_hydra.py).
+Every component shares the denominator $\sigma(x)$ of the run being analysed (clean or ablated). A component that
+changes the answer by changing what later components do has an indirect effect that DE does not see. Implemented in
+`head_direct_effects` in [`python/ioi_hydra.py`](../python/ioi_hydra.py).
 
 ## Results
 
@@ -135,44 +134,38 @@ This matches the ~3.5 reported by Wang et al. The corrupt prompts carry no IOI i
 
 **Template spread is a systematic.** Per-template LD ranges from 2.25 [1.78, 2.77] (*"The local big house where A
 and B lived was quiet. S handed a key to"*) to 4.15 [3.39, 4.92] (*"When A and B went to the park, S gave a ball
-to"*). That is well beyond the per-template statistical error, so a single-template study would understate the
-uncertainty on the baseline.
+to"*), well beyond the per-template statistical error, so a single-template study would understate the uncertainty
+on the baseline.
 
 ### 2. Residual-stream patching
 
 ![Residual patching](figures/resid_patching.png)
 
-Clean `resid_pre` is patched into the corrupt run at one (layer, position) at a time. This uses template 0 only, so
-that positions line up, with ABBA and BABA plotted separately because the IO and S1 slots swap between them. Each
-panel is normalized by its own clean and corrupt LD. Values above 1 mean the patch does *better* than the clean run.
+Clean `resid_pre` is patched into the corrupt run at one (layer, position) at a time, using template 0 only so that
+positions line up, with ABBA and BABA plotted separately because the IO and S1 slots swap between them. Each panel is
+normalized by its own clean and corrupt LD; values above 1 mean the patch does *better* than the clean run.
 
 - **The answer reaches the final token (`to`) at layers 9–10, and overshoots.** Patching that position does nothing
-  before layer 8, recovers 0.04–0.19 at layers 8–9, then jumps to **1.62 (ABBA) / 1.53 (BABA)** at layer 10. The
-  overshoot is copy suppression ([§4](#4-direct-logit-attribution)) failing to engage. The patched state carries
-  "Susan" from the name movers, but the negative name movers 10.7 and 11.10 suppress a name by attending to it in the
-  context, and the corrupt context contains no Susan. The brake that costs the clean run about 3 logits has nothing
-  to grip. At layer 11 (1.33 / 1.50), 10.7's braking is already in the patched state and only 11.10's is missing.
+  before layer 8, recovers 0.04–0.19 at layers 8–9, then jumps to **1.62 (ABBA) / 1.53 (BABA)** at layer 10 and
+  1.33 / 1.50 at layer 11. The patched state carries the answer, but the brakes 10.7 and 11.10 suppress a name by
+  attending to it in the context, and the corrupt context gives them nothing to grip (§4, §5).
 - **Single name positions carry the largest effects, ±1.1 to 1.5.** Patching the IO slot puts the IO name into the
-  corrupt context once, and the model copies it, a large positive effect. Patching S1 does the same for S, a large
-  negative one. Both fade at layers 10–11, after the name movers have read those positions. *(An earlier version of
-  this plot averaged ABBA with BABA, which cancelled these effects to about 0.)*
-- **The S2 column traces the circuit's timing.** Patching S2 (the repeated name) is strongly negative at layer 0
-  (−0.66 ABBA / −0.71 BABA), weakens to −0.15 / −0.01 by layer 7, is negative again at layer 9 (−0.31 in both), and
-  fades at layer 11. My reading:
-  early on, the patch inserts only the *token* S, appearing once, which the model copies. By layers 5–7 the patched
-  state also carries the "this name is a repeat" flag written by the duplicate-token and induction heads, which the
-  S-inhibition heads (layers 7–8) read and use to steer the name movers away from S. From layer 8 on, the flag
-  arrives after the S-inhibition heads have already read that position, but the token is still there for the name
-  movers (layers 9–10) to copy. This interpretation fits the layer timing but is not directly tested.
-- **This is partly an artifact of the corruption.** ABC changes two things at once (the repetition *and* the name
-  tokens), so patching a name position also inserts a name. An ABB → ABA corruption, which flips which name is
-  repeated while keeping the same names, would isolate the repetition cue (see [Next steps](#next-steps)).
+  corrupt context once and the model copies it; patching S1 does the same for S. Both fade at layers 10–11, after
+  the name movers have read those positions. Averaging ABBA with BABA would cancel these effects.
+- **The S2 column traces the circuit's timing.** Patching S2 (the repeated name) gives −0.66 (ABBA) / −0.71 (BABA)
+  at layer 0, −0.15 / −0.01 by layer 7, −0.31 at layer 9, and fades at layer 11. A reading that fits the layer timing
+  but is not directly tested: early on, the patch inserts only the *token* S, which the model copies; by layers 5–7
+  it also carries the "this name is a repeat" flag that the S-inhibition heads (layers 7–8) read; from layer 8 on, the
+  flag arrives too late to be read, but the token is still there for the name movers to copy.
+- **This is partly an artifact of the corruption.** ABC changes both the repetition and the name tokens, so patching
+  a name position also inserts a name. An ABB → ABA corruption, which flips which name is repeated while keeping the
+  same names, would isolate the repetition cue.
 
 ### 3. Per-head patching
 
 ![Head patching](figures/head_patching.png)
 
-Each head's clean output is patched into the corrupt run (denoising).
+Each head's clean output (all positions) is patched into the corrupt run (denoising).
 
 | head | role (Wang et al.) | normalized LD recovered |
 |---|---|---|
@@ -185,114 +178,72 @@ Each head's clean output is patched into the corrupt run (denoising).
 | 11.10 | negative name mover | −0.27 [−0.37, −0.18] |
 | 10.7 | negative name mover | **−0.62** [−0.72, −0.53] |
 
-The circuit's output heads reproduce. Two observations:
-
-**In this experiment, a head's patching effect equals its direct effect.** This heatmap looks almost identical to the
-DLA heatmap in §4: across all 144 heads, patching value ≈ DE / 3.43, with correlation 0.998 (e.g. 9.9: 0.87 vs 0.84;
-10.7: −0.62 vs −0.60). Patching head $h$ changes LD by a direct part (the head's own output changes) plus an
-indirect part (later components react):
+**Here, a head's patching effect equals its direct effect.** Across all 144 heads, patching ≈ DE / 3.43 with
+correlation 0.998 (9.9: 0.87 vs 0.84; 10.7: −0.62 vs −0.60), which is why this heatmap matches the one in §4.
+Patching head $h$ changes LD by a direct part plus a downstream reaction:
 
 $$LD_{\text{patched}} - LD_{\text{corrupt}} = \big(DE_h^{\text{clean}} - DE_h^{\text{corrupt}}\big) + \Delta_{\text{downstream}} \approx DE_h^{\text{clean}}$$
 
-Both extra terms are about zero because the corrupt context contains neither IO nor S. In the corrupt run the head
-copies other names, which doesn't move LD ($DE_h^{\text{corrupt}} \approx 0$), and after the patch the backups have
-nothing relevant to copy and the brakes nothing to suppress ($\Delta_{\text{downstream}} \approx 0$). Dividing by the
-clean − corrupt gap gives normalized patching ≈ $DE_h / 3.43$. It also explains why the patching values, summed with
-signs over all heads (each measured against its own prompt's corrupt LD), come to 0.84 [0.70, 0.98]: direct
-effects add, accounting for most but not all of the total. So per-head denoising into an ABC context measures each head's
-direct contribution, not the network's response. The two would differ for a corruption that keeps the names in context
-(ABB → ABA), or for ablation in the clean context (§5), where mean-ablating 9.9 alone drops LD by only
-0.34 [0.23, 0.44] despite its DE of 2.89.
+Both extra terms are about zero because the corrupt context contains neither IO nor S: the head's corrupt-run output
+copies other names, and after the patch the backups have nothing relevant to copy and the brakes nothing to
+suppress. Direct effects add, so the signed sum of patching values over all heads (each against its own prompt's
+corrupt LD) is 0.84 [0.70, 0.98]. Per-head denoising into an ABC context therefore measures direct contribution, not
+the network's response. Contrast §5: mean-ablating 9.9 alone drops LD by only 0.34 [0.23, 0.44] despite its DE of
+2.89.
 
 **Denoising measures sufficiency, not necessity.** The S-inhibition heads barely register here, yet ablating them
-in the clean run drops LD by 3.0 (§6). Their output means "don't attend to S", which does nothing in a corrupt run
-where IO and S never appear. The circuit behaves like an AND gate, so a head can be essential without being
-sufficient on its own.
+drops LD by 3.0 (§6). Their "don't attend to S" signal does nothing in a run where IO and S never appear. The
+circuit behaves like an AND gate, so a head can be essential without being sufficient on its own.
 
 ### 4. Direct logit attribution (direct effect on the logits)
 
 ![Direct effects](figures/direct_effects.png)
 
-**Comparison with Wang et al. Fig 3b.** That figure measures the same quantity with the opposite sign and different
-units. It patches each head's direct path to the logits with its ABC activation in a clean run and plots the
-resulting *change* in LD, as a percentage of clean LD. Since a head's direct effect in the ABC run is about 0 (§3),
+Wang et al.'s Fig 3b shows the same heads with the opposite sign and in percent: it patches each head's direct path
+to the logits with its ABC activation in a clean run and plots the change in LD relative to clean LD, so
 
 $$\text{Fig 3b} \approx \frac{DE_h^{\text{ABC}} - DE_h^{\text{clean}}}{LD^{\text{clean}}} \approx -\frac{DE_h^{\text{clean}}}{LD^{\text{clean}}}$$
 
-So name movers are positive here and negative in Fig 3b (e.g. 10.0: +0.53 logits here, about −16% there), and the
-negative name movers the reverse. The same heads stand out in both.
+(e.g. 10.0: +0.53 logits here, about −16% there).
 
-| head | DE (logits) | attention END → IO | attention END → S1 |
-|---|---|---|---|
-| 9.9 | **+2.89** [2.71, 3.07] | 0.77 | 0.07 |
-| 9.6 | +1.12 [1.00, 1.25] | 0.67 | 0.12 |
-| 10.10 | +0.55 [0.46, 0.65] | 0.33 | 0.09 |
-| 10.0 | +0.53 [0.40, 0.66] | 0.37 | 0.14 |
-| 10.6 | +0.39 [0.28, 0.50] | 0.35 | 0.11 |
-| 11.2 | −0.30 [−0.37, −0.23] | 0.08 | 0.11 |
-| 11.10 | −0.92 [−1.01, −0.82] | 0.62 | 0.09 |
-| 10.7 | **−2.06** [−2.20, −1.92] | **0.81** | 0.05 |
+| head | role | DE (logits) | attention END → IO | attention END → S1 | copy score | negative copy score |
+|---|---|---|---|---|---|---|
+| 9.9 | name mover | **+2.89** [2.71, 3.07] | 0.77 | 0.07 | **1.00** | 0.00 |
+| 9.6 | name mover | +1.12 [1.00, 1.25] | 0.67 | 0.12 | 0.90 | 0.00 |
+| 10.0 | name mover | +0.53 [0.40, 0.66] | 0.37 | 0.14 | 0.74 | 0.00 |
+| 10.10 | backup | +0.55 [0.46, 0.65] | 0.33 | 0.09 | 0.52 | 0.00 |
+| 10.6 | backup | +0.39 [0.28, 0.50] | 0.35 | 0.11 | 0.62 | 0.00 |
+| 10.2 | backup | +0.01 | 0.20 | 0.16 | 1.00 | 0.00 |
+| 10.1 | backup | +0.16 | 0.31 | 0.10 | 0.09 | 0.00 |
+| 11.2 | backup | −0.30 [−0.37, −0.23] | 0.08 | 0.11 | 0.92 | 0.00 |
+| 10.7 | brake | **−2.06** [−2.20, −1.92] | **0.81** | 0.05 | 0.00 | **0.98** |
+| 11.10 | brake | −0.92 [−1.01, −0.82] | 0.62 | 0.09 | 0.00 | **1.00** |
 
-The name movers attend to the IO name and raise the IO logit. The negative name movers attend to the *same* token
-and push it down. This is copy suppression ([McDougall et al. 2023](https://arxiv.org/abs/2310.04625)). Two further
-checks establish what "name mover" means: that these heads *copy* the name they read, and where they look.
+The **copy score** applies the head's OV circuit to the residual stream at the IO position, as the head reads it,
+and unembeds: this is what the head would write if it attended fully to the IO name. It is the fraction of prompts
+where the IO token is among the 5 highest of all 50,257 logits; the negative copy score, among the 5 lowest (Wang et
+al.).
 
-**Copying.** For each head, the residual stream at the IO position, as the head reads it, is passed through the
-head's OV circuit and unembedded: this is what the head would write if it attended fully to the IO name. Following
-Wang et al., the copy score is the fraction of prompts where the IO token is among the 5 highest of all 50,257
-logits, and the negative copy score the fraction where it is among the 5 lowest.
+A **name mover** attends to the IO name from the final position *and* copies what it reads. The brakes attend to the
+same name and anti-copy it, writing it as their most suppressed token: copy suppression
+([McDougall et al. 2023](https://arxiv.org/abs/2310.04625)). Copying alone is not enough: 6.9, 7.2, 7.10 and 8.11 also
+have copy scores above 0.9 but do not attend to IO from the final token. 11.2 copies but attends slightly more to S1,
+so its DE is negative; 10.1 attends to IO but barely copies (0.09), so this test does not explain its DE.
 
-| head | role | copy score | negative copy score | attention END → IO | DE |
-|---|---|---|---|---|---|
-| 9.9 | name mover | **1.00** | 0.00 | 0.77 | +2.89 |
-| 9.6 | name mover | 0.90 | 0.00 | 0.67 | +1.12 |
-| 10.0 | name mover | 0.74 | 0.00 | 0.37 | +0.53 |
-| 10.10 | backup | 0.52 | 0.00 | 0.33 | +0.55 |
-| 10.6 | backup | 0.62 | 0.00 | 0.35 | +0.39 |
-| 10.2 | backup | 1.00 | 0.00 | 0.20 | +0.01 |
-| 10.1 | backup | 0.09 | 0.00 | 0.31 | +0.16 |
-| 11.2 | backup | 0.92 | 0.00 | 0.08 | −0.30 |
-| 10.7 | brake | 0.00 | **0.98** | 0.81 | −2.06 |
-| 11.10 | brake | 0.00 | **1.00** | 0.62 | −0.92 |
-
-The name movers and most backups copy; the two brakes anti-copy, writing the name they read as its most
-*suppressed* token. Copying alone does not make a name mover: 6.9, 7.2, 7.10 and 8.11 also have copy scores above
-0.9 but do not attend to the IO name from the final token, so they never write it there. A name mover is the
-combination of attending to IO from the final position and copying what it reads. 11.2 illustrates this: it copies
-(0.92) but attends slightly more to S1 than to IO, so its net direct effect is negative. 10.1 is the exception among
-the backups: it attends to IO but has a low copy score (0.09), so this test does not explain its positive direct
-effect.
-
-**Attention.** Where each head looks from the final token, in the clean run and with the name movers mean-ablated
-(§5). The ablated heads are hatched in the right panel because their outputs are replaced and they write nothing.
-9.9's and 9.6's attention is unchanged by the ablation; 10.0's rises from 0.37 to 0.64 because it reads layer 9's
-output.
+**Attention**, in the clean run and with the name movers mean-ablated (§5; ablated heads hatched, since their
+outputs are replaced):
 
 ![Attention from the final token](figures/attention.png)
 
-In the clean run, the name movers and brakes attend mainly to IO, and the backups attend to IO more weakly. With the
-name movers removed, every backup roughly doubles its attention to IO (10.10: 0.33 → 0.62, 10.1: 0.31 → 0.56), while
-the brake 10.7 drops from 0.81 to 0.28 and spreads its attention to S1 and S2. This is the repair mechanism of §5,
-seen directly in where the heads look.
+With the name movers removed, every backup roughly doubles its attention to IO and the brake 10.7 drops from 0.81 to
+0.28, spreading its attention to S1 and S2: the repair mechanism of §5, seen in where the heads look. 9.9's and 9.6's
+attention is unchanged by the ablation; 10.0's rises from 0.37 to 0.64 because it reads layer 9's output.
 
 **The output is a small difference between large opposing terms.** The three name movers contribute +4.5
-directly, more than the total LD of 3.4; the negative heads subtract about 3. This sets up the self-repair below:
-remove one side, and the other can ease off.
+directly, more than the total LD of 3.4; the negative heads subtract about 3. Remove one side, and the other can ease
+off.
 
 ### 5. The Hydra effect
-
-![Change in direct effect](figures/hydra_delta_de.png)
-
-Each cell of the figure is the change in that head's direct effect when the name movers are ablated, in logits and
-averaged over prompts:
-
-$$\Delta DE_h = DE_h^{\text{ablated}} - DE_h^{\text{clean}}$$
-
-Blue means the head pushes LD up more than before, red that it pushes LD down more, white that it is unchanged. The
-colour shows the *change*, not the contribution itself: 10.7 is blue because it goes from −2.06 to +0.07, that is, it
-stops braking. Heads in layers 0–9 run before or alongside the ablated heads, so they are white by construction
-(apart from the shared LayerNorm scale); only layers 10–11 can respond. Summed over all heads, the cells give the
-change in LD up to a small remainder (see the full accounting below).
 
 Mean-ablate the name movers {9.9, 9.6, 10.0}. If the network were a sum of independent parts, LD would fall by the
 direct effect those heads lose. What actually happens:
@@ -303,26 +254,23 @@ direct effect those heads lose. What actually happens:
 | **total** (actual) = LD<sub>clean</sub> − LD<sub>ablated</sub> | **−0.15** [−0.33, 0.02] |
 | **repair fraction** = (direct − total) / direct | **1.03** [1.00, 1.07] |
 
-**Full accounting.** The change in LD splits exactly into the changes in each component's direct effect:
+![Change in direct effect](figures/hydra_delta_de.png)
 
-| | change in contribution to LD |
-|---|---|
-| ablated heads (9.9, 9.6, 10.0) | −4.57 |
-| all other heads | **+4.75** |
-| MLPs, embeddings, biases, LayerNorm | −0.03 |
-| **net change in LD** | **+0.15** |
+Each cell is $\Delta DE_h = DE_h^{\text{ablated}} - DE_h^{\text{clean}}$, in logits and averaged over prompts: blue
+means the head pushes LD up more than before, red that it pushes LD down more. It shows the *change*, not the
+contribution: 10.7 is blue because it stops braking (−2.06 → +0.07). Heads in layers 0–9 run before or alongside the
+ablated heads, so they are white by construction; only layers 10–11 can respond.
 
-The repair comes almost entirely from attention heads changing their outputs. The final LayerNorm scale drops by
-about 6% (17.8 → 16.6), which slightly inflates every head's DE, but the remainder after the heads is only −0.03.
-
-The same accounting as a waterfall, with the other heads split by mechanism. It starts at the clean LD, steps down by
-what the name movers lose, and steps back up through each response to the ablated LD:
+**Full accounting.** LD splits exactly into per-component direct effects in every run, so the change in LD splits
+exactly into the ΔDEs. Starting at the clean LD and stepping through each group's change:
 
 ![Repair waterfall](figures/repair_waterfall.png)
 
 The brake releasing (+2.13) and the backups stepping up (+2.45: 10.10, 10.2, 11.2, 10.6, 10.1) together more than
 replace the name movers' −4.57. The later brake 11.10 takes back 0.27, the remaining heads add 0.44, and MLPs,
-biases and LayerNorm change it by −0.03, ending at 3.53, slightly above the clean 3.38.
+biases and LayerNorm change it by −0.03, ending at 3.53, slightly above the clean 3.38. The repair is therefore
+done by attention heads: the final LayerNorm scale drops by about 6% (17.8 → 16.6), slightly inflating every head's
+DE, but the non-head remainder is only −0.03.
 
 **Which heads respond**, with the change in their attention from the final token to the IO name:
 
@@ -350,21 +298,17 @@ Three mechanisms are visible (see also the attention figure in §4):
 
 ### 6. Additivity
 
-Two different kinds of non-additivity:
-- **direct ≠ total** (§5): the network adjusts *downstream* of the ablation.
-- **Σ singles ≠ joint**: the heads *interact*, so ablating them one at a time doesn't add up to ablating them
-  together. Interaction = Σ singles − joint, with a paired bootstrap.
+§5 showed one kind of non-additivity: direct ≠ total, because the network adjusts downstream. Here is the other:
+whether ablating heads one at a time adds up to ablating them together, i.e. whether the heads interact.
+Interaction = Σ single drops − joint drop, with a paired bootstrap. Mean ablation shown; zero and resample agree to
+within about 0.3 (see the notebook).
 
-Mean ablation (zero and resample agree to within about 0.3; see the notebook):
-
-| head set | Σ single drops | joint drop | interaction | interpretation |
+| head set | Σ single drops | joint drop | interaction | kind |
 |---|---|---|---|---|
-| name movers | 0.10 [−0.06, 0.27] | −0.15 [−0.33, 0.02] | +0.26 [0.18, 0.33] | each one fully backed up, alone or together |
-| name movers + negative NMs | −2.45 [−2.70, −2.19] | −1.18 [−1.41, −0.95] | **−1.26** [−1.41, −1.11] | **dependency**: the two brakes ablated one at a time *raise* LD by about 2.55 (= −2.45 − 0.10), but with the name movers gone 10.7 has already released (§5) and removing it adds little |
-| name movers + backup NMs | 0.43 [0.24, 0.62] | 1.58 [1.29, 1.90] | **−1.16** [−1.37, −0.95] | **redundancy**: damage appears only when the backups are removed together |
-| S-inhibition | 3.65 [3.34, 3.96] | 3.05 [2.82, 3.27] | +0.60 [0.48, 0.73] | **saturation**: LD can only fall so far |
-
-The three kinds of interaction:
+| name movers | 0.10 [−0.06, 0.27] | −0.15 [−0.33, 0.02] | +0.26 [0.18, 0.33] | small: each is backed up, alone or together |
+| name movers + negative NMs | −2.45 [−2.70, −2.19] | −1.18 [−1.41, −0.95] | **−1.26** [−1.41, −1.11] | **dependency**: the brakes alone raise LD by about 2.55 (= −2.45 − 0.10), but once the name movers are gone 10.7 has already released |
+| name movers + backup NMs | 0.43 [0.24, 0.62] | 1.58 [1.29, 1.90] | **−1.16** [−1.37, −0.95] | **redundancy** |
+| S-inhibition | 3.65 [3.34, 3.96] | 3.05 [2.82, 3.27] | +0.60 [0.48, 0.73] | **saturation** |
 
 | kind | signature | example | intuition |
 |---|---|---|---|
@@ -372,22 +316,18 @@ The three kinds of interaction:
 | **dependency** | one effect is conditional on another | name movers + brakes | the brake only acts when there's something to brake |
 | **saturation** | joint < Σ singles | S-inhibition | a floor: you can't lose more than everything |
 
-Single-factor or sequential decompositions of a network's behaviour depend on order and context. Without the
-interaction term they can be badly wrong, in either direction.
+Without the interaction term, single-factor or sequential decompositions of a network's behaviour can be badly
+wrong, in either direction.
 
 ### 7. Systematics
 
 ![Direct vs total by ablation method](figures/direct_vs_total.png)
 
-**Reading the figure.** The blue bar (direct) is the drop LD would show if nothing else in the network reacted:
-the answer the three name movers were writing, minus what their replacement values write. It is the null hypothesis
-of no compensation. The red bar (total) is the drop that actually happens, and the gap between them is the repair.
-The blue bars are the same height for all three methods (4.54–4.57) because none of the replacements carries
-information about IO vs S: the ablated heads' DE falls to about 0 in every case, so direct ≈ DE<sub>9.9</sub> +
-DE<sub>9.6</sub> + DE<sub>10.0</sub> = 2.89 + 1.12 + 0.53. The blue bar is therefore effectively a fixed reference, and
-the result is that the red bar is about 0 however the heads are removed.
-
-In control-systems terms:
+**Reading the figure.** The blue bar (direct) is the drop LD would show if nothing else reacted: the null hypothesis
+of no compensation. The red bar (total) is the drop that actually happens; the gap is the repair. The blue bars are
+the same height for all three methods (4.54–4.57, ≈ 2.89 + 1.12 + 0.53) because no replacement carries information
+about IO vs S, so the blue bar is effectively a fixed reference. The result is that the red bar is about 0 however
+the heads are removed.
 
 | | control-systems term | here |
 |---|---|---|
@@ -395,10 +335,8 @@ In control-systems terms:
 | **total** (red) | closed-loop response: feedback on | about 0 |
 | **repair fraction** | how well the feedback regulates | about 1.0: complete regulation |
 
-The brake releasing and the backups stepping up (§5) are the feedback. One limit: the blue bar counts only the name
-movers' *direct* path to the logits. For heads in layers 9–10 whose job is writing the answer, that is most of their
-effect, but the precise no-feedback prediction would freeze every downstream activation at its clean value before
-ablating.
+The brake releasing and the backups stepping up (§5) are the feedback. The blue bar counts only the name movers'
+direct path to the logits; the exact no-feedback prediction would freeze every downstream activation before ablating.
 
 | variation | repair fraction |
 |---|---|
@@ -406,15 +344,12 @@ ablating.
 | template (8 templates) | 0.97 – 1.13, each about ±0.1 |
 | dataset seed (seeds 1–3; seed 0 above) | 1.04, 1.03, 1.02, each about ±0.04 |
 
-Near-complete self-repair is robust to every choice that could plausibly have broken it. Zero ablation gives the
-most over-repair, consistent with it pushing activations furthest off-distribution. The choices that *do*
-matter are the template, which moves the baseline LD (§1), and the corruption, which changes what position-level
-patching means (§2).
+Zero ablation over-repairs most, consistent with it pushing activations furthest off-distribution.
 
 **Why vary the ablation method.** "Remove a head" always means "replace its output with something", and each choice
-asks a different counterfactual question. Self-repair is a claim about how downstream heads *react*, which is exactly
-the kind of result an unnatural replacement could fake: downstream heads might respond to the unnaturalness of the
-input rather than to the missing information. The repair fraction held across all three methods.
+asks a different counterfactual question. Self-repair is a claim about how downstream heads *react*, exactly the kind
+of result an unnatural replacement could fake: downstream heads might respond to the unnaturalness of the input
+rather than to the missing information. The repair fraction held across all three methods.
 
 **Not yet varied**, roughly in order of expected importance:
 
@@ -430,38 +365,23 @@ input rather than to the missing information. The repair fraction held across al
 
 ## Conclusions
 
-1. **The IOI circuit's output stage reproduces in TransformerLens 4.x.** This is a replication of Wang et al.'s
-   circuit, not a new discovery. Baseline LD is 3.38 (Wang et al.: ~3.55), and the same late heads come out in the
-   same roles: name movers 9.9, 9.6, 10.0; negative name movers 10.7, 11.10; backups in layer 10. The answer reaches
-   the final position at layers 9–10. The S-inhibition heads are confirmed as necessary but their mechanism is not
-   examined, and the early duplicate-detection heads are not tested directly (§1–§4, §6). What the mechanism computes
-   is closer to "predict the name in context that isn't repeated" than to grammatical indirect-object detection: in
-   §2, a single name inserted into the corrupt prompt is copied whatever its grammatical role. In these templates the
-   two coincide.
-2. **The answer is a balance of opposing forces.** The name movers write about +4.5 logits toward the IO name;
-   copy-suppression heads attending to the same name write about −3.3. The output is a small difference between
-   large terms. When the brake has nothing to grip, as in the corrupt context of §2, the model overshoots the clean
-   run by 50–60% (§2, §4).
-3. **Self-repair is complete, robust, and done by attention heads.** Removing 4.6 logits of direct effect costs
-   nothing: repair fraction 1.03 [1.00, 1.07], holding across ablation methods, templates and name samples. About
-   45% is the brake 10.7 releasing and 55% is backups doubling their attention to the IO name, slightly offset by
-   11.10 tightening; MLPs, biases and LayerNorm together contribute −0.03 (§5, §7).
-4. **A component's importance depends on the question and on what else is present.** Direct effect, denoising and
-   ablation disagree, in opposite directions for the name movers and the S-inhibition heads (tables below). Heads
-   also interact through redundancy, dependency and saturation: removing the two brakes (10.7, 11.10) raises LD by
-   about 2.5 logits with the name movers present, but by only about 1.0 once the name movers are gone. Credit assignment is therefore order-dependent; Shapley values are the
-   principled alternative (§6).
+1. **The IOI circuit's output stage replicates** in TransformerLens 4.x: LD 3.38 (Wang et al.: ~3.55), the same name
+   movers, brakes and backups, and the answer arriving at layers 9–10 (§1–§4). The S-inhibition heads are confirmed
+   necessary but not examined, and the early duplicate-detection heads are not tested. The mechanism is closer to
+   "predict the name in context that isn't repeated" than to grammatical indirect-object detection (§2).
+2. **The answer is a balance of opposing forces:** about +4.5 logits from the name movers against −3.3 from the
+   brakes. With nothing to brake, the model overshoots the clean run by 50–60% (§2, §4).
+3. **Self-repair is complete, robust, and done by attention heads:** 1.03 [1.00, 1.07], about 45% from 10.7
+   releasing and 55% from backups, slightly offset by 11.10 (§5, §7).
+4. **A component's importance depends on the question and on what else is present.** The three tools disagree
+   (tables below), and heads interact: removing both brakes raises LD by about 2.5 with the name movers present but
+   by about 1.0 without them (§6). Credit assignment is order-dependent; Shapley values are the principled alternative.
 5. **The measurement design shapes what is found.** With an ABC corruption, per-head denoising reduces to direct
-   logit attribution (r = 0.998), and patching a name position inserts a token rather than restoring structure.
-   Normalized scores above 1 revealed an inhibitory process; a clipped colour scale and ABBA/BABA averaging had hidden
-   the largest effects. Templates move the baseline far beyond statistical error but not the repair fraction, and
-   the seed-to-seed spread matches the bootstrap error (§1–§3, §7).
-6. **Implications for interpretability practice.** Report direct and total effects together, report several
-   counterfactuals and treat their spread as a systematic, and measure interactions before trusting any "component X
-   explains Y%" decomposition. An automated agent ranking components by single-head ablation would call the name
-   movers unimportant, so self-repair is a built-in failure mode for automated interpretability unless direct and
-   total effects are compared. The same applies to steering or suppressing features: downstream compensation means
-   effects should be measured end to end.
+   logit attribution; scores above 1 revealed an inhibitory process; a clipped colour scale and ABBA/BABA averaging
+   had hidden the largest effects; templates move the baseline but not the repair fraction (§1–§3, §7).
+6. **For interpretability practice:** report direct and total effects, several counterfactuals, and interactions.
+   An automated agent ranking components by single-head ablation would call the name movers unimportant, and
+   steering or suppressing features can likewise be compensated downstream, so effects should be measured end to end.
 
 ### Interpreting the repair
 
@@ -472,9 +392,9 @@ behaviour unchanged. The data resolve this as follows:
   repeated, drops LD by 3.05 to near chance, and nothing repairs it. Removing the name movers, which write the
   answer, costs nothing. The network has one path for the computation and many paths for the output.
 - **"Name mover" is a role, not a head.** At least seven heads (9.9, 9.6, 10.0, 10.10, 10.6, 10.2, 11.2) attend to
-  the non-repeated name and copy it (copy score ≥ 0.5, §4). Normally 9.9 does most of the work; when it is removed, the others roughly
-  double their attention to the IO name. The circuit is better described as a graph of roles, each filled by a pool
-  of heads of different strengths (degeneracy, in biological terms), than as a list of specific heads.
+  the non-repeated name and copy it (copy score ≥ 0.5, §4). Normally 9.9 does most of the work; when it is removed,
+  the others roughly double their attention to the IO name. The circuit is better described as a graph of roles,
+  each filled by a pool of heads of different strengths (degeneracy, in biological terms), than as a list of heads.
 - **The output is regulated, not just computed.** The copy-suppression heads act as negative feedback on the
   predicted name's logit, plausibly for calibration. When the name movers stop pushing, the brake eases off, which
   accounts for about 45% of the repair. Robustness to ablation may be a side effect of this calibration rather than
@@ -484,10 +404,6 @@ behaviour unchanged. The data resolve this as follows:
 This is where Wang et al.'s criteria for a circuit (faithful, complete, minimal) come apart: a circuit without the
 backups looks complete until the name movers are ablated. Any method that judges a component's importance by
 removing it will misjudge the output stage.
-
-**What this study does not establish:** whether repair is this complete in larger models; *why* the backup heads'
-attention increases; exactly how much of the repair is LayerNorm rescaling; or what an ABB → ABA corruption would
-show (see [Caveats](#caveats) and [Next steps](#next-steps)).
 
 ### The study as causal mediation analysis
 
@@ -511,11 +427,9 @@ $$\underbrace{Y(x', M(x')) - Y(x, M(x))}_{\text{total effect}} = \underbrace{Y(x
 | **natural indirect effect** | the change carried through the mediators: the repair, broken down by mediator in the §5 waterfall | ≈ +4.72 |
 
 Self-repair is a large natural indirect effect, through the copy-suppression and backup heads, that almost exactly
-cancels the natural direct effect. One caveat: the direct effect here is computed from the direct-effect accounting
-rather than from a run with the mediators explicitly frozen, so it is an approximation to the natural direct effect
-(see [Next steps](#next-steps)).
-
-The other tools in this study have causal counterparts:
+cancels the natural direct effect. The direct effect here comes from the direct-effect accounting rather than from a
+run with the mediators explicitly frozen, so it approximates the natural direct effect (see
+[Limitations and next steps](#limitations-and-next-steps)).
 
 | interpretability tool | causal concept |
 |---|---|
@@ -527,18 +441,11 @@ The other tools in this study have causal counterparts:
 
 ### Sufficiency vs necessity
 
-The sections use two kinds of intervention, plus one that is neither:
-
-| test | what it does | question it answers |
-|---|---|---|
-| **denoising** (patching clean into corrupt) | add a clean piece into the corrupt run | **sufficiency**: is this piece enough to bring the answer back? |
-| **noising / ablation** (patching corrupt into clean, or mean / zero replacement) | remove a piece from the clean run | **necessity**: is this piece needed for the answer? |
-| **DLA** | no intervention, just accounting | **neither**: how much does this piece write directly? |
-
-*Patching* is the general operation of replacing an activation with its value from another input's run; its direction
-decides the question. Resample ablation is noising patching from the matched corrupt prompt. Mean and zero ablation
-are not patching in the strict sense, since the replacement does not come from a specific input, but they ask the
-same necessity question.
+*Patching* replaces an activation with its value from another input's run, and its direction decides the question.
+**Denoising** (patching clean into corrupt) tests **sufficiency**: is this piece enough to bring the answer back?
+**Noising / ablation** (patching corrupt into clean, or mean / zero replacement) tests **necessity**: is this piece
+needed? Resample ablation is noising patching from the matched corrupt prompt. **DLA** is accounting, not an
+intervention.
 
 | section | test | type | main finding |
 |---|---|---|---|
@@ -549,34 +456,32 @@ same necessity question.
 | §6 additivity | ablation | necessity | the S-inhibition heads are needed: removing them costs 3.0 |
 | §7 systematics | ablation (3 methods) | necessity | the §5 result holds for zero, mean and resample ablation |
 
-### The two tests disagree, in opposite directions
+The two tests disagree, in opposite directions:
 
 | | sufficient? (§3) | necessary? (§5, §6) |
 |---|---|---|
 | **name movers** (9.9, 9.6, 10.0) | **yes**: they write the answer | **no**: backups take over |
 | **S-inhibition** (7.3, 7.9, 8.6, 8.10) | **no**: they only steer | **yes**: nothing replaces them |
 
-Either test alone would give a misleading picture of the circuit. Denoising finds the components that write the
-output; ablation finds the ones the output depends on. Where the two disagree is where the network's structure is
-most informative: redundancy for the name movers, routing for the S-inhibition heads.
+Denoising finds the components that write the output; ablation finds the ones the output depends on. Where they
+disagree is where the network's structure shows: redundancy for the name movers, routing for the S-inhibition heads.
 
-## Caveats
+## Limitations and next steps
 
-1. **LayerNorm rescaling is only partly separated out.** Direct effects use each run's own final-LN scale, which
-   drops by about 6% when the name movers are ablated. The full accounting in §5 leaves a remainder of only −0.03,
-   so the effect looks small, but freezing the scale would be the direct test.
-2. **ABC corruption confounds patching at name positions** (§2). Whole-head patching and ablation are less affected,
-   but the residual-stream plot should be repeated with an ABB → ABA corruption.
-3. **MLPs are not decomposed.** Direct effects are computed for attention heads only.
-4. **One small model.** Whether self-repair is this complete in larger models is open.
+- **LayerNorm rescaling is only partly separated out.** The final-LN scale drops about 6% under the ablation; the §5
+  remainder is only −0.03, but freezing the scale would split the repair cleanly into head compensation and
+  rescaling.
+- **The no-feedback prediction is approximated.** Freezing all downstream activations before ablating would give
+  the exact natural direct effect to compare with the direct effect (§7).
+- **The ABC corruption** confounds patching at name positions (§2) and defines the mean and resample references.
+  Repeat §2–§3 and the ablations with an ABB → ABA corruption.
+- **Why the backups respond is not shown.** Path patching (as in Wang et al. Fig 4b) would show how 10.7 and the
+  backups detect that the name movers are missing, and would identify the S-inhibition heads directly rather than
+  by citation.
+- **MLPs are not decomposed.** Direct effects are computed for attention heads only.
+- **One small model.** Repeat on Pythia or Gemma-2-2B.
 
-## Next steps
-
-- Freeze the final-LN scale to split repair into head compensation and LayerNorm rescaling.
-- Freeze all downstream activations before ablating, for an exact no-feedback prediction to compare with the direct effect (§7).
-- Repeat §2–§3 with an ABB → ABA corruption.
-- Use path patching to find *how* 10.7 and the backup heads detect that the name movers are missing.
-- Repeat on Pythia or Gemma-2-2B.
+Other unvaried systematics are listed in §7.
 
 ## Reproducing
 
