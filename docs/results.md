@@ -31,8 +31,8 @@ output steady.
 | tool | question | for the name movers |
 |---|---|---|
 | **direct effect on the logits** (DLA, §4) | who's *voting* for the answer? | they cast most of the votes |
-| **denoising** (patching, §2–§3) | who's *enough* to bring it back? | they're enough on their own |
-| **ablation** (§5–§7) | who's *needed*? | they aren't: others change their votes |
+| **denoising** (patching clean into corrupt, §2–§3) | who's *enough* to bring it back? | they're enough on their own |
+| **ablation** (noising, §5–§7) | who's *needed*? | they aren't: others change their votes |
 
 Heads also interact (redundancy, dependency, saturation), so any "component X explains Y%" decomposition depends on
 the order of removal. Claims about component importance should report direct and total effects, several
@@ -489,15 +489,56 @@ removing it will misjudge the output stage.
 attention increases; exactly how much of the repair is LayerNorm rescaling; or what an ABB → ABA corruption would
 show (see [Caveats](#caveats) and [Next steps](#next-steps)).
 
+### The study as causal mediation analysis
+
+The Hydra measurement is a mediation analysis in Pearl's sense (Pearl 2001, "Direct and Indirect Effects"). The
+network is a deterministic structural causal model, the prompts are the population, and all effects are averaged
+over prompts:
+
+- **treatment** $X$: the name movers' output, clean ($x$) or mean-ablated ($x'$)
+- **mediators** $M$: everything downstream that can react (10.7, the backups, 11.10, …)
+- **outcome** $Y$: the logit difference
+
+Writing $Y(x, m)$ for the outcome with treatment $x$ and mediators at $m$, and $M(x)$ for the mediators' values under
+treatment $x$, the total effect splits exactly into a natural direct and a natural indirect effect:
+
+$$\underbrace{Y(x', M(x')) - Y(x, M(x))}_{\text{total effect}} = \underbrace{Y(x', M(x)) - Y(x, M(x))}_{\text{natural direct effect}} + \underbrace{Y(x', M(x')) - Y(x', M(x))}_{\text{natural indirect effect}}$$
+
+| mediation term | in this study | change in LD |
+|---|---|---|
+| **total effect** | ablate the name movers and let everything react (§5) | +0.15 |
+| **natural direct effect** | ablate them with the mediators held at their clean values: the "direct" bar in §5 and §7 | ≈ −4.57 |
+| **natural indirect effect** | the change carried through the mediators: the repair, broken down by mediator in the §5 waterfall | ≈ +4.72 |
+
+Self-repair is a large natural indirect effect, through the copy-suppression and backup heads, that almost exactly
+cancels the natural direct effect. One caveat: the direct effect here is computed from the direct-effect accounting
+rather than from a run with the mediators explicitly frozen, so it is an approximation to the natural direct effect
+(see [Next steps](#next-steps)).
+
+The other tools in this study have causal counterparts:
+
+| interpretability tool | causal concept |
+|---|---|
+| activation patching | a do-intervention on an intermediate variable: $\mathrm{do}(M = \text{its value under another input})$ |
+| denoising vs ablation (sufficiency vs necessity) | analogous to Pearl's probabilities of sufficiency and necessity (an analogy, not identical definitions) |
+| path patching (Wang et al.) | path-specific effects (Avin, Shpitser & Pearl 2005); Wang et al. build on causal mediation analysis for language models (Vig et al. 2020) |
+| head interactions (§6) | effect modification: one intervention's effect depends on the level of another |
+| order-dependent credit assignment (§6) | why mediation decompositions need a reference ordering, and why Shapley values are a principled alternative |
+
 ### Sufficiency vs necessity
 
 The sections use two kinds of intervention, plus one that is neither:
 
 | test | what it does | question it answers |
 |---|---|---|
-| **denoising** (patching) | add a clean piece into the corrupt run | **sufficiency**: is this piece enough to bring the answer back? |
-| **noising** (ablation) | remove a piece from the clean run | **necessity**: is this piece needed for the answer? |
+| **denoising** (patching clean into corrupt) | add a clean piece into the corrupt run | **sufficiency**: is this piece enough to bring the answer back? |
+| **noising / ablation** (patching corrupt into clean, or mean / zero replacement) | remove a piece from the clean run | **necessity**: is this piece needed for the answer? |
 | **DLA** | no intervention, just accounting | **neither**: how much does this piece write directly? |
+
+*Patching* is the general operation of replacing an activation with its value from another input's run; its direction
+decides the question. Resample ablation is noising patching from the matched corrupt prompt. Mean and zero ablation
+are not patching in the strict sense, since the replacement does not come from a specific input, but they ask the
+same necessity question.
 
 | section | test | type | main finding |
 |---|---|---|---|
