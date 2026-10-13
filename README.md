@@ -7,6 +7,9 @@ when the name-mover heads are ablated, with bootstrap CIs and ablation-method / 
 **Results: [docs/results.md](docs/results.md).** Headline: ablating the three name-mover heads removes 4.6 logits
 of direct effect, but the logit difference doesn't drop; the network repairs 103% (+4/−3%) of the damage.
 
+![Self-repair in GPT-2 small’s IOI circuit.](docs/figures/repair_waterfall.png)
+
+
 ## Setup
 
     source setup.sh

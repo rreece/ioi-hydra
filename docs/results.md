@@ -9,7 +9,8 @@ GPT-2 small completes *"When Susan and Robert went to the store, Robert gave a d
 circuit found by [Wang et al. 2022](https://arxiv.org/abs/2211.00593). I replicated it with TransformerLens 4.x and
 asked what happens when the heads that write the answer are removed
 ([McGrath et al. 2023, "The Hydra Effect"](https://arxiv.org/abs/2307.15771)). That this circuit self-repairs was
-already known; what is new here is a complete, uncertainty-quantified accounting of the repair (see
+already known; what is new here is a complete accounting of the repair, with bootstrap CIs over prompts and a first
+pass at systematics: ablation method, template and dataset seed (see
 [Relation to prior work](#relation-to-prior-work)).
 
 **Result.** Ablating the three name-mover heads removes 4.6 logits of direct effect, yet the logit difference does
@@ -38,7 +39,11 @@ Heads also interact (redundancy, dependency, saturation), so any "component X ex
 the order of removal. Claims about component importance should report direct and total effects, several
 counterfactuals, and interactions.
 
-All uncertainties are 95% percentile-bootstrap intervals over prompts (5000 resamples). *N* = 128 prompts.
+All uncertainties are 95% percentile-bootstrap intervals over prompts (5000 resamples). *N* = 128 prompts. The model
+is deterministic, so these are purely statistical errors from sampling inputs. They are conditional on one model
+(GPT-2 small), these 8 templates, the name pool and the ABC corruption. They treat prompts as independent, although
+they cluster by template. Systematics are reported separately as spreads (§7), not folded into the intervals.
+Whether the results generalize beyond this one model is not quantified.
 
 ## Relation to prior work
 
