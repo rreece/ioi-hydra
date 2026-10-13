@@ -420,6 +420,31 @@ over prompts:
 - **mediators** $M$: everything downstream that can react (10.7, the backups, 11.10, …)
 - **outcome** $Y$: the logit difference
 
+```mermaid
+flowchart LR
+    P["prompt"] --> U["S-inhibition heads<br/>(the decision)"]
+    U --> X["<b>X</b>: name movers<br/>9.9, 9.6, 10.0<br/>do(X = mean-ablated)"]
+    subgraph M ["<b>M</b>: mediators, which react to X (indirect effect +4.72)"]
+        M1["10.7 brake"]
+        M2["backups: 10.10, 10.2,<br/>11.2, 10.6, 10.1"]
+        M3["11.10 brake"]
+        M4["other heads"]
+        M5["MLPs, biases,<br/>LayerNorm"]
+    end
+    U --> M
+    X --> M
+    X == "direct effect: −4.57" ==> Y(["<b>Y</b>: logit difference"])
+    M1 -- "+2.13" --> Y
+    M2 -- "+2.45" --> Y
+    M3 -- "−0.27" --> Y
+    M4 -- "+0.44" --> Y
+    M5 -- "−0.03" --> Y
+```
+
+Edge labels are changes in LD when the name movers are ablated, taken from the §5 waterfall. The thick edge is the
+direct path; the mediator edges sum to the indirect effect, and the two together give the total effect, +0.15. The
+mediators also read the upstream decision and each other (layer 10 feeds layer 11); those edges are not drawn.
+
 Writing $Y(x, m)$ for the outcome with treatment $x$ and mediators at $m$, and $M(x)$ for the mediators' values under
 treatment $x$, the total effect splits exactly into a natural direct and a natural indirect effect:
 
