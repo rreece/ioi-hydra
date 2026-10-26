@@ -64,7 +64,7 @@ Stage 1 is built and validated on 1M tokens, with both backends. The code lives 
 | Full 1M-token atlas, HF vs. TL backend | means, stds, quantiles agree to ~1e-5 relative; largest difference in any unit's max is 2e-4; 0.6% of top-k pointers swap among exact ties (identical left contexts) |
 | Pointers reproduce: recompute stored top-k entries from `(row, pos)` | 10 of 10 match to 5 decimals, layers 0, 9 and 11 |
 | Two-shard run merged by `export` | 7,813 rows from shards 0:4000 and 4000:7813 |
-| Residual stream behaves like known GPT-2 | variance grows ~5000× from layer 0 to the final residual; dim 447 is the dominant outlier from layer 8 on |
+| Residual stream behaves like known GPT-2 | variance grows ~5000× from layer 0 to the final residual; the largest-variance dimension is 480 in layers 1–7, 447 in layers 8–10 and 496 in layers 11–12; effective dimension peaks at ~170 in layers 7–9 and collapses to ~7 at the final residual |
 | Neurons behave like known GPT-2 | rarely-firing neurons (firing rate < 1e-4) concentrate in layers 0–2: 63, 86, 21 |
 
 **Measured cost (M4, MPS, 1M tokens)**
@@ -72,15 +72,15 @@ Stage 1 is built and validated on 1M tokens, with both backends. The code lives 
 | Quantity | TL bridge | Plain HF (default) |
 | --- | --- | --- |
 | Forward pass with hooks on all 25 points | ~5,300 tok/s | ~9,600 tok/s |
-| Full run, all accumulators | ~3,200 tok/s | ~3,900 tok/s |
-| Wall time for 1M tokens (run only) | ~5 min | ~4.3 min |
+| Full run, all accumulators | ~3,200 tok/s (before tuning) | ~5,150 tok/s after tuning (fused moments, int32 histograms, histograms on every 4th token) |
+| Wall time for 1M tokens (run only) | ~5 min | ~3.2 min |
 | State file per shard | 171 MB (histograms 97 MB, covariance 61 MB), independent of token count | same |
 
 Tokenizing takes about 1 min and export 9 s with either backend.
 
 **Known limitations**
 
-- The accumulators now cost more than the model: the forward pass is 1.8× faster on HF, but the full run only 22% faster. Not yet profiled; the histogram step is the likely cost.
+- The accumulators still cost about as much as the forward pass (full run ~5,150 vs ~9,700 tok/s forward-only on an M4): top-k and histograms each read every MLP activation. Histograms use every 4th token, which shifts quantiles by a median 0.02 std at p99 (0.13 std for the worst 1% of units). Further speed belongs on CUDA.
 - 1M tokens come from only 909 documents, so exemplars cluster within documents.
 - Top-k keeps only the largest values; residual dimensions need bottom-k too.
 - Statistics cover positions 1–127 only. Behaviour that depends on long context is not seen.

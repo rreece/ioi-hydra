@@ -29,7 +29,8 @@ About 4 minutes end to end on CPU on an M4.
 Activation atlas, stage 1 (streaming per-neuron statistics, top-k exemplars and residual covariance
 over OpenWebText; see the docstring of `python/atlas.py`):
 
-    run-atlas                                # 1M tokens -> results/atlas/*.parquet, ~6 min on an M4
+    run-atlas                                # 1M tokens -> results/atlas/*.parquet, ~4 min on an M4
+    jupyter lab notebooks/atlas.ipynb        # explore it: residual geometry, neuron stats, top contexts
     python -c "import duckdb; duckdb.sql(\"select value, context from 'results/atlas/topk.parquet' where kind='post' and layer=9 and unit=1000 order by rank\").show()"
     pytest tests                             # exact merging; HF backend == TransformerLens bridge (~10 s)
 
@@ -38,7 +39,8 @@ over OpenWebText; see the docstring of `python/atlas.py`):
 
     python/ioi_hydra.py         helpers: dataset, patching, direct effects, ablations, bootstrap
     python/atlas.py             activation atlas: tokenize, mergeable accumulators, export (CLI: python -m atlas)
-    notebooks/ioi_hydra.ipynb   the analysis
+    notebooks/ioi_hydra.ipynb   the IOI + Hydra analysis
+    notebooks/atlas.ipynb       atlas exploration: residual geometry, neuron statistics, top contexts
     scripts/run-notebook        headless execution
     scripts/run-atlas           atlas pipeline end to end
     tests/                      atlas tests: exact merging; HF backend matches TransformerLens

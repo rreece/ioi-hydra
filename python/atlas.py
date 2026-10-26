@@ -123,13 +123,12 @@ class Moments(Accumulator):
 
     def update(self, x: torch.Tensor):
         """x: [N, d] on any device."""
+        # One fused var_mean and a single device -> CPU transfer (each .cpu() is a sync).
+        var, mean = torch.var_mean(x, 0, correction=0)
+        n_pos = (x > 0).sum(0, dtype=torch.float32)  # exact: counts per batch are far below 2**24
+        mean, m2, mx, n_pos = torch.stack([mean, var * x.shape[0], x.max(0).values, n_pos]).cpu().double()
         b = Moments.__new__(Moments)
-        mean = x.mean(0)
-        b.n = x.shape[0]
-        b.mean = mean.cpu().double()
-        b.m2 = ((x - mean) ** 2).sum(0).cpu().double()
-        b.max = x.max(0).values.cpu().double()
-        b.n_pos = (x > 0).sum(0).cpu()
+        b.n, b.mean, b.m2, b.max, b.n_pos = x.shape[0], mean, m2, mx, n_pos.long()
         self.merge(b)
 
     def merge(self, b: Moments):
@@ -180,6 +179,17 @@ class Covariance(Accumulator):
         return self.c / self.n
 
 
+_ONES: dict = {}
+
+
+def _ones_int32(n: int, device) -> torch.Tensor:
+    """A cached vector of n int32 ones on `device`, so histogram updates don't allocate one per call."""
+    buf = _ONES.get(str(device))
+    if buf is None or len(buf) < n:
+        buf = _ONES[str(device)] = torch.ones(n, dtype=torch.int32, device=device)
+    return buf[:n]
+
+
 def asinh_edges(n_bins: int = 256, lim: float = 1e4, scale: float = 0.01) -> torch.Tensor:
     """Bin edges spaced evenly in asinh(x / scale): linear (width about scale * 0.1) near zero,
     logarithmic (about 12% relative width) for |x| >> scale, covering [-lim, lim]."""
@@ -208,8 +218,10 @@ class Histogram(Accumulator):
 
     def update(self, x: torch.Tensor):
         d, nb = self.counts.shape
-        flat = torch.bucketize(x, self._edges) + torch.arange(d, device=x.device) * nb
-        self.counts += torch.bincount(flat.flatten(), minlength=d * nb).view(d, nb)
+        flat = (torch.bucketize(x, self._edges) + torch.arange(d, device=x.device) * nb).flatten()
+        # int32 scatter_add is ~25% faster than bincount on MPS; per-batch counts fit in int32.
+        batch = torch.zeros(d * nb, dtype=torch.int32, device=x.device).scatter_add_(0, flat, _ones_int32(len(flat), x.device))
+        self.counts += batch.view(d, nb)
 
     def merge(self, b: Histogram):
         assert torch.equal(self.edges, b.edges), "histograms must share edges to merge"
@@ -283,10 +295,21 @@ def hook_kind(name: str) -> str:
     return "resid" if "hook_resid" in name else name.split(".")[-1].removeprefix("hook_")
 
 
+def hist_mask(index: torch.Tensor, T: int, stride: int) -> torch.Tensor:
+    """Which tokens feed the histograms: every `stride`-th non-BOS token by global counter
+    row * (T - 1) + (pos - 1). Depends only on the token's global position, so any sharding or batching
+    selects the same tokens and merging stays exact; with T - 1 odd, the selection cycles through all positions."""
+    return ((index // T) * (T - 1) + index % T - 1) % stride == 0
+
+
 class Atlas:
-    def __init__(self, hooks: dict[str, int], k: int = 20, n_bins: int = 256, device="cpu"):
+    """Accumulators for every hook. Moments, top-k and covariance see every token; histograms (and so the
+    exported quantiles) see every `hist_stride`-th token, which cuts their cost, the largest, by that factor."""
+
+    def __init__(self, hooks: dict[str, int], k: int = 20, n_bins: int = 256, hist_stride: int = 1, device="cpu"):
         edges = asinh_edges(n_bins)
         self.hooks = dict(hooks)
+        self.hist_stride = hist_stride
         self.n_rows = 0
         self.acc: dict[str, dict[str, Accumulator]] = {}
         for name, d in hooks.items():
@@ -300,13 +323,14 @@ class Atlas:
         x = act[:, 1:].reshape(-1, act.shape[-1]).float()
         a = self.acc[name]
         a["moments"].update(x)
-        a["hist"].update(x)
+        a["hist"].update(x if self.hist_stride == 1 else x[hist_mask(index, act.shape[1], self.hist_stride)])
         a["topk"].update(x, index)
         if "cov" in a:
             a["cov"].update(x)
 
     def merge(self, other: Atlas):
         assert self.hooks == other.hooks
+        assert self.hist_stride == other.hist_stride, "histograms from different token subsamples cannot merge"
         self.n_rows += other.n_rows
         for name, a in self.acc.items():
             for kind, acc in a.items():
@@ -315,6 +339,7 @@ class Atlas:
     def state(self) -> dict:
         return {
             "hooks": self.hooks,
+            "hist_stride": self.hist_stride,
             "n_rows": self.n_rows,
             "acc": {name: {kind: acc.state() for kind, acc in a.items()} for name, a in self.acc.items()},
         }
@@ -324,6 +349,7 @@ class Atlas:
         classes = {"moments": Moments, "hist": Histogram, "topk": TopK, "cov": Covariance}
         obj = cls.__new__(cls)
         obj.hooks, obj.n_rows = state["hooks"], state["n_rows"]
+        obj.hist_stride = state.get("hist_stride", 1)  # states written before subsampling existed
         obj.acc = {
             name: {kind: classes[kind].from_state(s, device) for kind, s in a.items()}
             for name, a in state["acc"].items()
@@ -421,11 +447,12 @@ BACKENDS = {"hf": HFGPT2, "tl": TLGPT2}
 # ---------------------------------------------------------------------------------------------
 
 
-def run(model, tokens: np.ndarray, start: int, stop: int, batch_size: int = 64, k: int = 20, device="cpu", progress=True) -> Atlas:
+def run(model, tokens: np.ndarray, start: int, stop: int, batch_size: int = 64, k: int = 20, hist_stride: int = 1,
+        device="cpu", progress=True) -> Atlas:
     from tqdm.auto import tqdm
 
     hooks = default_hooks(model.cfg)
-    atlas = Atlas(hooks, k=k, device=device)
+    atlas = Atlas(hooks, k=k, hist_stride=hist_stride, device=device)
     last = list(hooks)[-1]
     T = tokens.shape[1]
     pos = torch.arange(1, T, device=device)
@@ -558,6 +585,7 @@ def main(argv=None):
     s.add_argument("--rows", default=":", help="START:STOP row range (default: all)")
     s.add_argument("--batch-size", type=int, default=64)
     s.add_argument("--k", type=int, default=20)
+    s.add_argument("--hist-stride", type=int, default=4, help="histograms (quantiles) use every Nth token; 1 = all")
     s.add_argument("--device", default=default_device())
     s.add_argument("--backend", choices=list(BACKENDS), default="hf", help="hf: plain transformers (fast); tl: TransformerLens bridge (reference)")
     s = sub.add_parser("export", help="merge state-*.pt -> parquet + npz")
@@ -581,7 +609,7 @@ def main(argv=None):
         tokens = np.load(args.dir / "tokens.npy", mmap_mode="r")
         start, stop = (int(x) if x else d for x, d in zip(args.rows.split(":"), (0, len(tokens))))
         t0 = time.time()
-        atlas = run(load_model(args.device, args.backend), tokens, start, stop, args.batch_size, args.k, args.device)
+        atlas = run(load_model(args.device, args.backend), tokens, start, stop, args.batch_size, args.k, args.hist_stride, args.device)
         dt = time.time() - t0
         state = atlas.state() | {"rows": (start, stop), "model": "gpt2", "backend": args.backend,
                                  "git_commit": git_commit(), "torch": str(torch.__version__), "seconds": dt}

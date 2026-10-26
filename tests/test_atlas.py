@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from atlas import BOS, Atlas, Covariance, Histogram, Moments, TopK, asinh_edges, tokenize
+from atlas import BOS, Atlas, Covariance, Histogram, Moments, TopK, asinh_edges, hist_mask, tokenize
 
 
 @pytest.fixture
@@ -68,17 +68,19 @@ def test_histogram_counts_and_quantiles(x):
     np.testing.assert_allclose(q, ref, rtol=0.06)
 
 
-def test_atlas_state_round_trip_and_merge(x, tmp_path):
+@pytest.mark.parametrize("stride", [1, 4])
+def test_atlas_state_round_trip_and_merge(x, tmp_path, stride):
     hooks = {"blocks.0.mlp.hook_post": 7, "blocks.0.hook_resid_pre": 7}
     act = x[:4800].reshape(48, 100, 7)  # [B, T, d]
     index = (torch.arange(48)[:, None] * 100 + torch.arange(1, 100)).flatten()
 
-    whole = Atlas(hooks, k=3)
-    a, b = Atlas(hooks, k=3), Atlas(hooks, k=3)
+    # Split at row 7: 7 * 99 tokens is not a multiple of the stride, so the subsample must not depend on batching.
+    whole = Atlas(hooks, k=3, hist_stride=stride)
+    a, b = Atlas(hooks, k=3, hist_stride=stride), Atlas(hooks, k=3, hist_stride=stride)
     for name in hooks:
         whole.update(name, act, index)
-        a.update(name, act[:20], index[: 20 * 99])
-        b.update(name, act[20:], index[20 * 99 :])
+        a.update(name, act[:7], index[: 7 * 99])
+        b.update(name, act[7:], index[7 * 99 :])
     torch.save(b.state(), tmp_path / "b.pt")
     a.merge(Atlas.from_state(torch.load(tmp_path / "b.pt")))
 
@@ -91,8 +93,18 @@ def test_atlas_state_round_trip_and_merge(x, tmp_path):
                     torch.testing.assert_close(sa[key], sw[key], rtol=1e-5, atol=1e-6)
                 else:
                     assert sa[key] == sw[key]
-    # Position 0 (BOS) is excluded.
+    # Position 0 (BOS) is excluded; histograms see 1 in `stride` of the remaining tokens.
     assert whole.acc["blocks.0.mlp.hook_post"]["moments"].n == 48 * 99
+    assert whole.acc["blocks.0.mlp.hook_post"]["hist"].counts.sum(1).eq(-(-48 * 99 // stride)).all()
+
+
+def test_hist_mask_cycles_through_positions():
+    T, rows, stride = 128, 400, 4
+    index = (torch.arange(rows)[:, None] * T + torch.arange(1, T)).flatten()
+    m = hist_mask(index, T, stride)
+    assert m.sum() == rows * (T - 1) // stride
+    per_pos = m.view(rows, T - 1).sum(0)  # how often each position 1..127 is selected
+    assert per_pos.min() >= rows // stride - 1 and per_pos.max() <= rows // stride + 1
 
 
 def test_tokenize_rows_are_bos_plus_one_document_window():
