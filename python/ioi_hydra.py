@@ -363,6 +363,32 @@ def hydra(ablator: Ablator, heads, kind: str, clean_ld: torch.Tensor, de_clean: 
     return {"ld": ld, "total": total, "direct": direct, "repair": direct - total, "delta_de": delta}
 
 
+def freeze_hooks(model, clean_cache, except_heads=()):
+    """Hooks that hold every component except `except_heads` at its value in the clean run: all other
+    heads' hook_z, every MLP output and the final LayerNorm scale. Nothing can react to an intervention."""
+    L, H = model.cfg.n_layers, model.cfg.n_heads
+    fwd_hooks = []
+    for l in range(L):
+        keep = [h for h in range(H) if (l, h) not in except_heads]
+
+        def freeze_z(x, hook, l=l, keep=keep):
+            x[:, :, keep] = clean_cache[f"blocks.{l}.attn.hook_z"][:, :, keep]
+            return x
+
+        fwd_hooks.append((f"blocks.{l}.attn.hook_z", freeze_z))
+        fwd_hooks.append((f"blocks.{l}.hook_mlp_out", lambda x, hook, l=l: clean_cache[f"blocks.{l}.hook_mlp_out"]))
+    fwd_hooks.append(("ln_final.hook_scale", lambda x, hook: clean_cache["ln_final.hook_scale"]))
+    return fwd_hooks
+
+
+def natural_direct_effect(ablator: Ablator, heads, kind: str, clean_cache, clean_ld: torch.Tensor) -> torch.Tensor:
+    """Exact natural direct effect of ablating `heads` (Pearl 2001), as a per-prompt drop in LD [N]:
+    LD(x, M(x)) - LD(x', M(x)). The heads are ablated while every mediator is held at its own clean value
+    for that prompt (freeze_hooks), so the network cannot compensate. Comparable with hydra()'s "direct"."""
+    hooks = freeze_hooks(ablator.model, clean_cache, heads) + ablator.hooks(heads, kind)
+    return clean_ld - logit_diff(ablator.model.run_with_hooks(ablator.ds.clean_tokens, fwd_hooks=hooks), ablator.ds)
+
+
 def additivity(ablator: Ablator, heads, kind: str, clean_ld: torch.Tensor):
     """Single-head ablation drops vs the joint ablation drop. Returns per-prompt tensors:
     singles [N, k], joint [N]. Additive iff joint == singles.sum(-1)."""
