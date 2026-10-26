@@ -1,0 +1,335 @@
+ ▐▛███▛█   Claude Code v2.1.306
+▝▜██████▀  Opus 5.5 · Claude Pro
+ ▝▝   ▝▝   ~/Development/ioi-hydra
+
+
+❯ /resume                                                                       
+  ⎿  This conversation is from a different directory.
+
+     To resume, run:
+       cd /Users/ryan/Development/resume && claude --resume
+     cf2d6530-e7df-4a7b-822f-3fb1154d9b69
+
+     (Command copied to clipboard)
+
+❯ note what is going on in this ioi-hydra project. it's my first project in     
+  mechanistic interpretability.                                                 
+                                                                                
+  what if i were asked to do some kind of telemetry at scale for many (or all   
+  activations) for gpt2. let's talk through what would be some smart ways to do 
+  it. what kind of technologies should i use?                                   
+
+  Ran 3 shell commands, wrote 1 memory (ctrl+o to expand)
+
+⏺ What I noted about ioi-hydra
+
+  It's a one-day replication of the IOI circuit in GPT-2 small using
+  TransformerLens 4.x. You ablate the name-mover heads and measure the
+  Hydra-effect self-repair. Headline: the network repairs 103% [100%, 107%] of
+  the damage. About 45% comes from the copy-suppression head 10.7 releasing its
+  brake, and about 55% from backup name movers. The write-up is strong on the
+  statistics side: bootstrap CIs, systematics reported separately, and direct
+  vs. total effects kept apart. I saved this to memory so future sessions have
+  the context. The only uncommitted change is notebook kernel metadata.
+
+  Everything ran at small scale: 128 prompts, run_with_cache on every hook, on a
+  laptop CPU. That approach is exactly what breaks first at scale, so it's a
+  good place to start.
+
+  Telemetry at scale for GPT-2: how I'd think about it
+
+  1. Work out the data volume first
+
+  GPT-2 small has 12 layers, d_model 768, d_mlp 3072 and 12 heads. Rough float
+  counts per token:
+
+  ┌──────────────────────────────────────┬──────────────────┬───────────────┐
+  │                 What                 │   Floats/token   │ bf16 per 1B   │
+  │                                      │                  │    tokens     │
+  ├──────────────────────────────────────┼──────────────────┼───────────────┤
+  │ Residual stream at 13 points         │ ~10k             │ ~20 TB        │
+  │ (pre-layer ×12 + final)              │                  │               │
+  ├──────────────────────────────────────┼──────────────────┼───────────────┤
+  │ + attn_out, mlp_out, z, q/k/v, MLP   │ ~150k            │ ~300 PB       │
+  │ pre/post, all layers                 │                  │               │
+  ├──────────────────────────────────────┼──────────────────┼───────────────┤
+  │ Attention patterns (144 heads × ~512 │ ~75k             │ absurd        │
+  │  avg context)                        │                  │               │
+  ├──────────────────────────────────────┼──────────────────┼───────────────┤
+  │ SAE features (L0 ≈ 50 nonzeros,      │ ~50 (idx, val)   │ ~0.3 TB       │
+  │ stored sparse)                       │ pairs            │               │
+  └──────────────────────────────────────┴──────────────────┴───────────────┘
+
+  "All activations, stored" isn't feasible past millions of tokens. Never store
+  attention patterns. If you need them, store q and k, or better, recompute.
+
+  2. The key point: activations are a pure function of (weights, tokens)
+
+  GPT-2 small costs about 0.25 GFLOP per token. One H100 should push several
+  hundred thousand tokens per second, so recomputing 1B tokens takes well under
+  an hour. Reading 20 TB back from storage is often slower. So:
+
+  - Store the tokens plus provenance: model revision hash, tokenizer, dataset
+    shard, document ID and offset, and the LN-folding convention. GPT-2's vocab
+    is 50257, which fits in uint16, so a token stream costs 2 bytes per token.
+  - Store reductions and pointers, not raw tensors. A max-activating example is
+    (doc_id, pos, value). Rerun the model when you need the full context.
+
+  It's like a physics trigger and reconstruction pipeline: you keep the
+  summaries and the event IDs, not every raw readout.
+
+  3. Reduce on the GPU, inside the hook
+
+  The usual bottleneck is moving activations from the GPU to host memory or
+  disk, not the compute. Each hook should update GPU-resident accumulators and
+  return. Every accumulator should also be mergeable, so shards can map-reduce:
+
+  - Mean and variance per neuron: Welford's method, merged across shards with
+    Chan's parallel formula. Accumulate in fp64.
+  - Covariance: accumulate XᵀX in fp64. That's 768² for the residual stream and
+    3072² for the MLP, both tiny. This gets you PCA, whitening and effective
+    dimensionality.
+  - Quantiles and histograms: fixed log-spaced bins (trivially mergeable), or
+    t-digest/DDSketch sketches.
+  - Firing rate and sparsity: counts of values above a threshold.
+  - Top-k exemplars per neuron or feature: torch.topk per batch, merged into a
+    running top-k. This is how Neuroscope-style dashboards get built.
+  - Random exemplars: reservoir sampling, so you see typical behavior and not
+    just extremes.
+
+  4. Log in a better basis than neurons
+
+  Neurons are polysemantic. The modern approach is to run pretrained sparse 
+  autoencoders (SAEs) on the residual stream; SAELens has GPT-2 small residual
+  SAEs for every layer. Then log sparse feature activations as (token_idx, 
+  layer, feature_id, value) rows. That's interpretable and about 100× smaller
+  than the dense residual stream, so storing everything in that basis becomes
+  practical.
+
+  5. When you do need raw activations (e.g. to train your own SAE)
+
+  - Subsample tokens, say a few million per hook point, rather than keeping all
+    of them.
+  - Use bf16 (or per-channel int8) in chunked shards: safetensors, Zarr, or .npy
+    memmaps on S3 or GCS.
+  - Many SAE training setups skip storage entirely: they generate activations on
+    the fly into a shuffle buffer.
+
+  Suggested stack
+
+  Layer: Model + hooks
+  Choice: TransformerLens (you know it) or plain HF transformers + 
+  register_forward_hook for raw throughput; nnsight is worth a look
+  Why: TL adds overhead. nnsight's tracing API is clean, and NDIF lets you run
+  it
+  remotely on bigger models later
+  ────────────────────────────────────────
+  Layer: Throughput
+  Choice: bf16, torch.compile, large batches, fixed-length packed sequences (no
+  padding)
+  Why: GPT-2 is small, so you're limited by data movement, not FLOPs
+  ────────────────────────────────────────
+  Layer: Data
+  Choice: OpenWebText (closest to GPT-2's training distribution) or FineWeb,
+  pre-tokenized to uint16 memmap shards
+  Why: cheap, reproducible, seekable by offset
+  ────────────────────────────────────────
+  Layer: Parallelism
+  Choice: data-parallel only: one process per GPU per shard via Ray, a SLURM
+  array, or k8s jobs
+  Why: the model fits anywhere; no model parallelism needed
+  ────────────────────────────────────────
+  Layer: Outputs
+  Choice: Parquet for summaries and sparse feature events; Zarr/safetensors for
+  dense tensors; object storage
+  Why: columnar, compressible, splittable
+  ────────────────────────────────────────
+  Layer: Query
+  Choice: DuckDB (or Polars) directly over the Parquet
+  Why: "top contexts for feature 4123 in layer 8" is one SQL query, with no
+  database server
+  ────────────────────────────────────────
+  Layer: Visualization
+  Choice: SAEDashboard / Neuronpedia-style feature pages
+  Why: top-k plus histograms per feature is the standard view
+
+  Gotchas you'll hit
+
+  - The BOS token/position 0 has huge residual norms and acts as an attention
+    sink. It will dominate means, variances and top-k unless you exclude or flag
+    it.
+  - Packing across documents lets attention leak between unrelated texts. Insert
+    BOS separators, or record document boundaries and filter on them.
+  - Your telemetry is conditional on the corpus. This is the same lesson as your
+    systematics section: firing rates on OpenWebText differ from those on code
+    or IOI templates. Version the dataset and treat it as a systematic.
+  - Pin the conventions: folded vs. unfolded LayerNorm and centered unembedding
+    change the numbers, and you already ran into this with compatibility mode.
+
+  Which design fits depends on what "telemetry" means here
+
+  - A research atlas (what does every neuron or feature do?): streaming stats +
+    top-k + SAE features → Parquet + DuckDB. This is the default above.
+  - Training data for SAEs or probes: subsampled raw activations, or on-the-fly
+    generation with a shuffle buffer.
+  - Live production monitoring (drift, anomaly or deception probes on traffic):
+    lightweight probes and sketches in the serving path, emitting metrics to
+    something like Prometheus/OpenTelemetry. Here vLLM-style servers make
+    hooking harder.
+
+  If you tell me which of these you'd be asked for, I can sketch a concrete
+  pipeline. A natural first step would be a script in this repo that streams 10M
+  OpenWebText tokens through GPT-2 and writes per-neuron stats plus top-k
+  exemplars to Parquet.
+
+✻ Churned for 1m 15s · done 5:09 PM
+
+※ recap: We're planning how to log activations for all of GPT-2 at scale, building on your IOI-hydra project; I've proposed computing statistics on the GPU and storing tokens plus summaries. Next: tell me which kind of telemetry you'd be asked for, so I can sketch the pipeline. (disable recaps in /config)
+
+❯ before continuing, say more about the third option. what if we needed to      
+  monitor live serving from models in vllm?                                     
+
+⏺ Monitoring live vLLM serving
+
+  Live monitoring is a different problem from the offline atlas. The constraints
+  flip: latency and throughput matter more than completeness, and you can't
+  change the batch however you like. You also don't control which tokens get
+  computed.
+
+  Why you can't just add hooks to vLLM
+
+  vLLM is built for throughput, and several of its optimizations break the
+  TransformerLens habits you have:
+
+  vLLM feature: CUDA graphs (used for decode by default)
+  What it does to activation monitoring: Python forward hooks run only while the
+
+  graph is being captured, not on replay. So hooks either silently stop firing
+  or force you to set enforce_eager=True, which costs a lot of decode
+  throughput.
+  ────────────────────────────────────────
+  vLLM feature: Continuous batching with a flattened token batch
+  What it does to activation monitoring: There's no [batch, pos] tensor. Tokens
+  from many requests are concatenated, and you have to map them back to
+  requests using the step's attention metadata (per-request start offsets).
+  ────────────────────────────────────────
+  vLLM feature: Prefix caching
+  What it does to activation monitoring: Cached prompt tokens are never 
+  recomputed, so they produce no activations at all. A probe on "the prompt"
+  sees only the uncached suffix.
+  ────────────────────────────────────────
+  vLLM feature: Chunked prefill
+  What it does to activation monitoring: One prompt is spread across several
+  engine steps, so per-request aggregation has to keep state between steps.
+  ────────────────────────────────────────
+  vLLM feature: Preemption / recompute
+  What it does to activation monitoring: A request can be evicted and recomputed
+
+  later, which gives duplicate telemetry. Deduplicate on (request_id, 
+  position).
+  ────────────────────────────────────────
+  vLLM feature: Speculative decoding
+  What it does to activation monitoring: Rejected draft tokens produce
+  activations for text the user never sees. Throw those away.
+  ────────────────────────────────────────
+  vLLM feature: Tensor / pipeline parallel
+  What it does to activation monitoring: After the all-reduce the residual
+  stream
+  is replicated on every rank, so compute probes on one rank. MLP intermediates
+   are sharded. Under pipeline parallelism, a probe runs on whichever stage
+  owns its layer.
+  ────────────────────────────────────────
+  vLLM feature: Separate processes
+  What it does to activation monitoring: The model runs in worker processes, not
+
+  the API server, so telemetry has to cross a process boundary.
+
+  A tiered design: keep as little as possible in the serving path
+
+                     ┌──────────── serving path (latency-critical) ────────────┐
+  request ──► API ──►│ scheduler ──► worker: forward pass                      
+  │──► response
+                     │                 ├─ Tier 1: in-graph probes → GPU buffer │
+                     │                 └─ async D2H copy after each step       │
+                     └──────────────────────┬──────────────────────────────────┘
+            Tier 0: logprobs/entropy        │ background thread: per-request 
+  aggregation
+                                            ▼
+                      metrics (Prometheus/OTel)  +  event log (Kafka/Parquet)
+                                            │
+                Tier 2: sampled (prompt, completion) tokens ──► offline replay 
+  in HF/TL
+                                                                → full 
+  activations, SAEs, anything
+
+  Tier 0: output-level signals (nearly free). vLLM already returns logprobs.
+  Per-token entropy, top-k margin and surprisal of the sampled token are cheap,
+  need no changes to vLLM internals, and catch a lot: confusion, distribution
+  shift, degenerate loops. Start here.
+
+  Tier 1: in-graph probes (the core of live monitoring). Make the probe part of
+  the model, not a hook:
+
+  - Subclass the model class and register it through vLLM's out-of-tree model or
+    plugin mechanism, so you don't have to fork vLLM.
+  - At a few chosen layers, compute probe_out = resid @ W_probe (linear probes)
+    or a narrow SAE encoder over the features you care about. Write the result
+    into a preallocated persistent GPU buffer. Because these are plain tensor
+    ops with static shapes, they get captured inside the CUDA graph and replay
+    correctly.
+  - After each step, copy only the reduced outputs (a few floats per token, not
+    4096-d residual vectors) to pinned host memory without blocking. A
+    background thread maps tokens to requests, aggregates (max, mean, or a
+    running exceedance count), and emits the results.
+  - Cost: a linear probe is negligible. A 65k-feature SAE encoder on a 4096-d
+    residual is roughly one extra transformer layer's worth of FLOPs, so about
+    3% per instrumented layer on a 32-layer model. Instrument few layers, or
+    keep only the SAE features you actually monitor (slice the encoder rows).
+
+  Tier 2: sampled replay (the recompute principle again). Log the token IDs of a
+  sample of requests along with the model revision. Replay them offline on a
+  separate box with HF or TransformerLens to get full activations, run any SAE,
+  or try new probes on historical traffic. This needs no changes to the serving
+  stack. It's also where you develop and validate the probes that get promoted
+  into Tier 1.
+
+  What only works in the serving path
+
+  Anything that has to act on the signal: stopping generation, routing to
+  review, or steering by adding a vector to the residual stream. That makes the
+  probe synchronous, so the decision has to be made on the GPU or within the
+  step budget. Steering is the same mechanism as Tier 1 in reverse: an in-graph
+  add from a persistent buffer, indexed per request.
+
+  Things that will catch you out
+
+  - Prefix caching vs. prompt probes. Either disable prefix caching for
+    monitored traffic, or store probe outputs alongside the KV blocks, keyed by
+    the same block hash, so a cache hit also returns cached telemetry. The
+    second option is the clever one, but it's more work.
+  - Numerical mismatch. vLLM's batched kernels aren't bit-identical to HF, and
+    results can depend on what else is in the batch. Replay activations will
+    differ slightly from live ones, so calibrate probe thresholds on vLLM
+    outputs, not on TransformerLens outputs.
+  - Probe drift is a systematic. Validate probes on held-out traffic and track
+    their score distributions over time, much like you'd monitor calibration. A
+    probe trained on IOI-style templates is like your 128-prompt dataset:
+    conditional on its distribution.
+  - Privacy. Activations can be partially inverted back to the input text. Apply
+    the same access controls and retention policy to them as to the prompts.
+  - Version churn. vLLM internals (forward context, attention metadata, plugin
+    APIs) change quickly. Pin the version and keep the instrumentation in a
+    thin, well-tested layer.
+
+  Practical note for you
+
+  GPT-2 is supported in vLLM, so you could prototype all three tiers on it. But
+  vLLM really wants a Linux machine with an NVIDIA GPU, not the M4. A good
+  learning project: serve GPT-2 in vLLM, train a linear probe offline with
+  TransformerLens (e.g. "is this an IOI-style sentence?" at layer 8), then add
+  it in-graph. Check that live probe scores match replayed scores to within
+  numerical tolerance, and measure the throughput cost against plain vLLM.
+
+  Want to go back to the offline atlas design, or sketch this probe prototype?
+
+✻ Cooked for 56s · done 5:55 PM

@@ -23,9 +23,11 @@ Conventions
   (row, pos) into `tokens.npy`, not as tensors. To get anything else, rerun the model on those rows.
 - Position 0 (BOS) is excluded from all statistics. Its residual norm is an outlier by orders of
   magnitude (an attention sink) and would dominate every mean, variance and top-k.
-- As in ioi_hydra, the model runs with `enable_compatibility_mode()` (folded LayerNorm, centered
-  writing weights). MLP neuron values are unchanged by this processing. The residual stream has
-  its mean over d_model removed, i.e. it follows HookedTransformer's convention, not raw HF GPT-2.
+- Activations follow TransformerLens's processed convention (`enable_compatibility_mode()`: folded
+  LayerNorm, centered writing weights), as in ioi_hydra and the SAELens SAEs. MLP neuron values are
+  unchanged by this processing; the residual stream has its mean over d_model removed. The default
+  backend, `HFGPT2`, reproduces this from plain HF transformers; `TLGPT2` is the bridge itself, kept
+  as the reference (tests/test_backends.py checks they agree).
 - MPS has no float64, so each batch is reduced on the device in float32. Moments and covariances
   are then merged on the CPU in float64 using Chan et al.'s parallel formulas.
 - All statistics are conditional on the corpus (OpenWebText) and on positions 1..seq_len-1.
@@ -39,6 +41,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -328,8 +331,94 @@ class Atlas:
         return obj
 
 
+# ---------------------------------------------------------------------------------------------
+# Model backends
+#
+# A backend has `cfg` (n_layers, d_model, d_mlp) and `run(tokens, hooks)`, which calls
+# hooks[name](act) with act [B, T, d] at each named hook point. Names and values follow
+# TransformerLens. A hook may raise _Stop to end the forward pass early.
+# ---------------------------------------------------------------------------------------------
+
+
 class _Stop(Exception):
-    """Raised from the last hook so the forward pass skips ln_final and the 50k-wide unembed."""
+    """Raised from the last hook so the forward pass skips the remaining layers and the unembed."""
+
+
+class HFGPT2:
+    """GPT-2 in plain Hugging Face transformers, with TransformerLens hook names and conventions.
+
+    Centering the writing weights is linear, so it equals subtracting each token's mean over d_model
+    from everything written to the residual stream (resid_*, attn_out, mlp_out). Folding LayerNorm
+    leaves the MLP pre- and post-activations unchanged. This avoids the bridge's per-module hook
+    overhead (about 1.8x faster on an M4) and keeps the model plain for bf16 and torch.compile later.
+    """
+
+    def __init__(self, device="cpu", name="gpt2"):
+        from transformers import GPT2Model
+
+        self.model = GPT2Model.from_pretrained(name).to(device).eval()  # no LM head: nothing to unembed
+        c = self.model.config
+        self.cfg = SimpleNamespace(n_layers=c.n_layer, d_model=c.n_embd, d_mlp=c.n_inner or 4 * c.n_embd)
+
+    def _register(self, name: str, fn):
+        _, layer, *rest = name.split(".")
+        block = self.model.h[int(layer)]
+        center = lambda x: x - x.mean(-1, keepdim=True)
+        first = lambda out: out[0] if isinstance(out, tuple) else out
+        match rest:
+            case ["hook_resid_pre"]:
+                return block.register_forward_pre_hook(
+                    lambda m, args, kw: fn(center(args[0] if args else kw["hidden_states"])), with_kwargs=True)
+            case ["hook_resid_mid"]:
+                return block.ln_2.register_forward_pre_hook(lambda m, args: fn(center(args[0])))
+            case ["hook_resid_post"]:
+                return block.register_forward_hook(lambda m, args, out: fn(center(first(out))))
+            case ["hook_attn_out"]:
+                return block.attn.register_forward_hook(lambda m, args, out: fn(center(first(out))))
+            case ["hook_mlp_out"]:
+                return block.mlp.register_forward_hook(lambda m, args, out: fn(center(out)))
+            case ["mlp", "hook_pre"]:
+                return block.mlp.act.register_forward_pre_hook(lambda m, args: fn(args[0]))
+            case ["mlp", "hook_post"]:
+                return block.mlp.act.register_forward_hook(lambda m, args, out: fn(out))
+        raise KeyError(f"HFGPT2 has no hook {name!r}")
+
+    def run(self, tokens: torch.Tensor, hooks: dict):
+        handles = [self._register(name, fn) for name, fn in hooks.items()]
+        try:
+            self.model(tokens)
+        except _Stop:
+            pass
+        finally:
+            for h in handles:
+                h.remove()
+
+
+class TLGPT2:
+    """The TransformerLens bridge in compatibility mode: the reference implementation."""
+
+    def __init__(self, device="cpu", name="gpt2"):
+        from transformer_lens.model_bridge import TransformerBridge
+
+        self.model = TransformerBridge.boot_transformers(name, device=device)
+        self.model.enable_compatibility_mode()
+        self.cfg = self.model.cfg
+
+    def run(self, tokens: torch.Tensor, hooks: dict):
+        # Bind each fn to the name we registered: the bridge's hook.name is the canonical name, not the alias.
+        with self.model.hooks(fwd_hooks=[(name, lambda act, hook, fn=fn: fn(act)) for name, fn in hooks.items()]):
+            try:
+                self.model(tokens, return_type=None)
+            except _Stop:
+                pass
+
+
+BACKENDS = {"hf": HFGPT2, "tl": TLGPT2}
+
+
+# ---------------------------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------------------------
 
 
 def run(model, tokens: np.ndarray, start: int, stop: int, batch_size: int = 64, k: int = 20, device="cpu", progress=True) -> Atlas:
@@ -343,25 +432,20 @@ def run(model, tokens: np.ndarray, start: int, stop: int, batch_size: int = 64, 
     index = None
 
     def make_hook(name):
-        # Bind the name we registered: the bridge's hook.name is the canonical name, not the alias.
-        def hook(act, hook):
+        def hook(act):
             atlas.update(name, act, index)
             if name == last:
                 raise _Stop
 
         return hook
 
-    fwd_hooks = [(name, make_hook(name)) for name in hooks]
+    callbacks = {name: make_hook(name) for name in hooks}
 
     for r0 in tqdm(range(start, stop, batch_size), disable=not progress, unit="batch"):
         r1 = min(r0 + batch_size, stop)
         toks = torch.from_numpy(tokens[r0:r1].astype(np.int64)).to(device)
         index = (torch.arange(r0, r1, device=device)[:, None] * T + pos).flatten()
-        with model.hooks(fwd_hooks=fwd_hooks):
-            try:
-                model(toks, return_type=None)
-            except _Stop:
-                pass
+        model.run(toks, callbacks)
         atlas.n_rows += r1 - r0
     return atlas
 
@@ -442,12 +526,8 @@ def default_device() -> str:
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-def load_model(device: str):
-    from transformer_lens.model_bridge import TransformerBridge
-
-    model = TransformerBridge.boot_transformers("gpt2", device=device)
-    model.enable_compatibility_mode()
-    return model
+def load_model(device: str, backend: str = "hf"):
+    return BACKENDS[backend](device)
 
 
 def load_tokenizer():
@@ -479,6 +559,7 @@ def main(argv=None):
     s.add_argument("--batch-size", type=int, default=64)
     s.add_argument("--k", type=int, default=20)
     s.add_argument("--device", default=default_device())
+    s.add_argument("--backend", choices=list(BACKENDS), default="hf", help="hf: plain transformers (fast); tl: TransformerLens bridge (reference)")
     s = sub.add_parser("export", help="merge state-*.pt -> parquet + npz")
     s.add_argument("dir", type=Path)
     args = p.parse_args(argv)
@@ -500,9 +581,9 @@ def main(argv=None):
         tokens = np.load(args.dir / "tokens.npy", mmap_mode="r")
         start, stop = (int(x) if x else d for x, d in zip(args.rows.split(":"), (0, len(tokens))))
         t0 = time.time()
-        atlas = run(load_model(args.device), tokens, start, stop, args.batch_size, args.k, args.device)
+        atlas = run(load_model(args.device, args.backend), tokens, start, stop, args.batch_size, args.k, args.device)
         dt = time.time() - t0
-        state = atlas.state() | {"rows": (start, stop), "model": "gpt2", "compatibility_mode": True,
+        state = atlas.state() | {"rows": (start, stop), "model": "gpt2", "backend": args.backend,
                                  "git_commit": git_commit(), "torch": str(torch.__version__), "seconds": dt}
         path = args.dir / f"state-{start}-{stop}.pt"
         torch.save(state, path)
