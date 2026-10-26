@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 import torch
 
-from atlas import BOS, Atlas, Covariance, Histogram, Moments, TopK, asinh_edges, hist_mask, tokenize
+from atlas import (BOS, Atlas, Covariance, Histogram, Moments, TopK, asinh_edges, bootstrap_weights, hist_mask,
+                   pooled_cov_summaries, pooled_moments, shard_ranges, tokenize)
 
 
 @pytest.fixture
@@ -118,3 +119,47 @@ def test_tokenize_rows_are_bos_plus_one_document_window():
     assert docs.tolist() == [[0, 0], [0, 3], [0, 6]]
     tokens, docs = tokenize(["10", "2", "8"], FakeTokenizer(), n_tokens=16, seq_len=4)
     assert docs.tolist()[-1] == [2, 0]
+
+
+def test_tokenize_caps_windows_per_document():
+    class FakeTokenizer:
+        def __call__(self, texts):
+            return {"input_ids": [list(range(int(t))) for t in texts]}
+
+    tokens, docs = tokenize(["30", "2", "30", "30"], FakeTokenizer(), n_tokens=12, seq_len=4, max_windows_per_doc=1, seed=0)
+    assert docs[:, 0].tolist() == [0, 2, 3]  # one window per document; doc 1 is too short
+    assert all(off % 3 == 0 and off <= 27 for off in docs[:, 1])
+    again, _ = tokenize(["30", "2", "30", "30"], FakeTokenizer(), n_tokens=12, seq_len=4, max_windows_per_doc=1, seed=0)
+    assert np.array_equal(tokens, again)  # seeded: reproducible
+
+
+def test_shard_ranges_respect_files():
+    files = np.array([0] * 10 + [1] * 6)
+    assert shard_ranges(files, 4) == [(0, 5), (5, 10), (10, 13), (13, 16)]
+    with pytest.raises(AssertionError):
+        shard_ranges(files, 3)
+
+
+def test_bootstrap_weights_resample_within_groups():
+    w = bootstrap_weights([0, 0, 0, 1, 1], n_boot=200)
+    assert (w[:, :3].sum(1) == 3).all() and (w[:, 3:].sum(1) == 2).all()
+
+
+def test_pooled_moments_and_cov_match_exact_merge(x):
+    shards = torch.split(x, [1000, 1500, 1200, 1300])
+    ms, cs = [Moments(x.shape[1]) for _ in shards], [Covariance(x.shape[1]) for _ in shards]
+    for m, c, sh in zip(ms, cs, shards):
+        m.update(sh)
+        c.update(sh)
+    n = np.array([float(m.n) for m in ms])
+    stack = lambda f: np.stack([f(m) for m in ms])
+    reps = pooled_moments(np.ones((1, 4)), n, stack(lambda m: m.mean.numpy()), stack(lambda m: m.m2.numpy()),
+                          stack(lambda m: m.n_pos.double().numpy()))
+    xd = x.double().numpy()
+    np.testing.assert_allclose(reps["mean"][0], xd.mean(0), rtol=1e-6)
+    np.testing.assert_allclose(reps["std"][0], xd.std(0), rtol=1e-5)
+    np.testing.assert_allclose(reps["frac_pos"][0], (xd > 0).mean(0))
+    total, pr = pooled_cov_summaries(np.ones((1, 4)), n, np.stack([c.mean.numpy() for c in cs]), np.stack([c.c.numpy() for c in cs]))
+    lam = np.linalg.eigvalsh(np.cov(xd, rowvar=False, bias=True))
+    np.testing.assert_allclose(total[0], lam.sum(), rtol=1e-5)
+    np.testing.assert_allclose(pr[0], lam.sum() ** 2 / (lam**2).sum(), rtol=1e-5)

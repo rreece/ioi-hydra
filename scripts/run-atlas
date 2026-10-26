@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Stage 1 activation atlas for GPT-2 small: tokenize OpenWebText, accumulate statistics, export Parquet.
 #     run-atlas                          # 1M tokens into results/atlas
-#     run-atlas results/atlas-10M 1e7
+#     run-atlas results/atlas-2M 2e6
 # For sharding, call the steps directly: python -m atlas {tokenize,run,export} --help
 set -euo pipefail
 : "${PROJECT_PATH:?source setup.sh first}"
 dir="${1:-${PROJECT_PATH}/results/atlas}"
 n_tokens="${2:-1e6}"
-python -m atlas tokenize "${dir}" --n-tokens "${n_tokens}"
-python -m atlas run "${dir}"
+python -m atlas tokenize "${dir}" --n-tokens "${n_tokens}"   # 2 OpenWebText files, 1 window per document
+python -m atlas run "${dir}" --shards 8                      # 4 shards per file, for bootstrap errors
 python -m atlas export "${dir}"

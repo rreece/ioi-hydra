@@ -4,16 +4,19 @@ Pipeline
 --------
 1. `tokenize`: OpenWebText -> `tokens.npy`, uint16 [n_rows, seq_len]. Each row is [BOS] followed by
    a (seq_len - 1)-token window of a single document. Windows never cross documents, and partial
-   tail windows are dropped. `docs.npy` holds (doc_id, offset) for each row.
+   tail windows are dropped. By default each document contributes one randomly chosen window and
+   rows come from two OpenWebText files, so 1M tokens span ~8k documents and the two files give a
+   corpus systematic. `docs.npy` holds (file, doc_id, offset) for each row.
 2. `run`: stream rows through the model. Forward hooks reduce each batch on the device into
    mergeable accumulators (moments, histograms, top-k, residual covariance), so raw activations
-   never leave the device. Writes one `state-<start>-<stop>.pt` per row range, so shards can run
-   in parallel on any number of machines.
+   never leave the device. Writes one `state-<start>-<stop>.pt` per row range: `--shards N` runs N
+   ranges (none straddling two files) in one process, `--rows` one range, on any machine.
 3. `export`: merge all states in the directory and write `neurons.parquet`, `topk.parquet`,
-   `resid.npz` and `histograms.npz`, ready for querying with DuckDB.
+   `resid.npz` and `histograms.npz`, ready for querying with DuckDB. With several shards it adds
+   bootstrap errors (resampling shards within each file) and per-shard moments (`shards.parquet`).
 
     python -m atlas tokenize results/atlas --n-tokens 1000000
-    python -m atlas run results/atlas                  # or --rows 0:4000 on one machine, 4000:8000 on another
+    python -m atlas run results/atlas --shards 8       # or --rows 0:4000 on one machine, 4000:7874 on another
     python -m atlas export results/atlas
     python -c "import duckdb; duckdb.sql(\"select * from 'results/atlas/topk.parquet' where layer = 9 and unit = 123 order by rank\").show()"
 
@@ -36,6 +39,7 @@ Conventions
 from __future__ import annotations
 
 import argparse
+import copy
 import itertools
 import json
 import subprocess
@@ -66,19 +70,27 @@ def owt_texts(shard: int = 0):
         yield from batch.column("text").to_pylist()
 
 
-def tokenize(texts, tokenizer, n_tokens: int, seq_len: int = 128, batch_size: int = 256):
+def tokenize(texts, tokenizer, n_tokens: int, seq_len: int = 128, max_windows_per_doc: int | None = None,
+             seed: int = 0, batch_size: int = 256):
     """Splits documents into rows of [BOS] + (seq_len - 1) tokens from one document.
+
+    With max_windows_per_doc, a document with more windows contributes that many, chosen at random
+    (seeded, so reproducible): rows then span many more documents, at the cost of tokenizing more text.
 
     Returns tokens, uint16 [n_rows, seq_len], and docs, int64 [n_rows, 2] holding
     (doc_id, offset of the row's first non-BOS token within the document).
     """
     w = seq_len - 1
     n_rows = -(-n_tokens // seq_len)
+    rng = np.random.default_rng(seed)
     rows, docs = [], []
     doc_id = 0
     for batch in itertools.batched(texts, batch_size):
         for ids in tokenizer(list(batch))["input_ids"]:
-            for off in range(0, len(ids) - w + 1, w):
+            offs = range(0, len(ids) - w + 1, w)
+            if max_windows_per_doc and len(offs) > max_windows_per_doc:
+                offs = sorted(int(o) for o in rng.choice(offs, max_windows_per_doc, replace=False))
+            for off in offs:
                 rows.append([BOS] + ids[off : off + w])
                 docs.append((doc_id, off))
                 if len(rows) == n_rows:
@@ -478,6 +490,73 @@ def run(model, tokens: np.ndarray, start: int, stop: int, batch_size: int = 64, 
 
 
 # ---------------------------------------------------------------------------------------------
+# Statistical errors: bootstrap over shards
+#
+# Each shard is an independent sample of rows, so resampling shards with replacement and pooling
+# them gives bootstrap errors for any mergeable statistic. Shards are resampled within their
+# OpenWebText file, so the file-to-file difference stays a separate, systematic, comparison.
+# Rows within a shard are correlated (neighbouring documents, shared topics); resampling whole
+# shards accounts for that, at the price of few resampling units: treat errors from 4 shards per
+# file as approximate.
+# ---------------------------------------------------------------------------------------------
+
+
+def shard_ranges(files: np.ndarray, n_shards: int) -> list[tuple[int, int]]:
+    """Split rows into n_shards contiguous ranges, none straddling two files: each file's rows get
+    the same number of shards. files: [n_rows] file of each row (rows grouped by file)."""
+    bounds = np.flatnonzero(np.diff(files)) + 1
+    starts, stops = np.concatenate([[0], bounds]), np.concatenate([bounds, [len(files)]])
+    assert n_shards % len(starts) == 0, f"--shards {n_shards} must be a multiple of the {len(starts)} files"
+    out = []
+    for a, b in zip(starts, stops):
+        edges = np.linspace(a, b, n_shards // len(starts) + 1).round().astype(int)
+        out += list(zip(edges[:-1].tolist(), edges[1:].tolist()))
+    return out
+
+
+def bootstrap_weights(groups, n_boot: int = 500, seed: int = 0) -> np.ndarray:
+    """[n_boot, S]: how many times each shard appears in each resample, drawn within each group."""
+    groups = np.asarray(groups)
+    rng = np.random.default_rng(seed)
+    w = np.zeros((n_boot, len(groups)))
+    for g in np.unique(groups):
+        idx = np.flatnonzero(groups == g)
+        w[:, idx] = rng.multinomial(len(idx), np.full(len(idx), 1 / len(idx)), size=n_boot)
+    return w
+
+
+def pooled_moments(w, n, mean, m2, n_pos, chunk: int = 50):
+    """Pool per-shard moments with shard multiplicities w [B, S]. n [S]; mean, m2, n_pos [S, U].
+    Returns mean, std, frac_pos, each [B, U]; with w = 1 this is exactly Moments.merge over the shards."""
+    out = {"mean": [], "std": [], "frac_pos": []}
+    for wb in np.array_split(w, max(1, len(w) // chunk)):
+        nw = wb @ n
+        mu = (wb * n) @ mean / nw[:, None]
+        # Sum of squared deviations about the pooled mean: within-shard m2 plus each shard's offset.
+        ss = np.einsum("bs,su->bu", wb, m2) + np.einsum("bs,s,bsu->bu", wb, n, (mean[None] - mu[:, None]) ** 2)
+        out["mean"].append(mu)
+        out["std"].append(np.sqrt(ss / nw[:, None]))
+        out["frac_pos"].append((wb @ n_pos) / nw[:, None])
+    return {k: np.concatenate(v) for k, v in out.items()}
+
+
+def pooled_cov_summaries(w, n, mean, c, chunk: int = 50):
+    """Total variance and participation ratio (tr C)^2 / ||C||_F^2 of the pooled covariance, for each
+    resample w [B, S]. n [S]; mean [S, d]; c [S, d, d] (sums of centered outer products). Returns [B], [B]."""
+    S, d = mean.shape
+    A = (c + n[:, None, None] * mean[:, :, None] * mean[:, None, :]).reshape(S, -1)  # raw second moments
+    total, pr = [], []
+    for wb in np.array_split(w, max(1, len(w) // chunk)):
+        nw = wb @ n
+        mu = (wb * n) @ mean / nw[:, None]
+        C = (wb @ A).reshape(-1, d, d) / nw[:, None, None] - mu[:, :, None] * mu[:, None, :]
+        tr = np.trace(C, axis1=1, axis2=2)
+        total.append(tr)
+        pr.append(tr**2 / (C**2).sum((1, 2)))
+    return np.concatenate(total), np.concatenate(pr)
+
+
+# ---------------------------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------------------------
 
@@ -500,7 +579,10 @@ def contexts(tokens: np.ndarray, tokenizer, row: np.ndarray, pos: np.ndarray, be
     return tok_s[inv.ravel()], ctx_s[inv.ravel()]
 
 
-def export(atlas: Atlas, tokens: np.ndarray, tokenizer, out: Path):
+def export(atlas: Atlas, tokens: np.ndarray, tokenizer, out: Path, shards: list[Atlas] = (), groups=(), n_boot: int = 500):
+    """Write the merged atlas. With two or more shards (and the file of each in `groups`), also write
+    bootstrap errors (`*_err` columns, resid.npz `*_err`), per-file residual summaries and the
+    per-shard moments in shards.parquet."""
     import pandas as pd
 
     T = tokens.shape[1]
@@ -523,6 +605,23 @@ def export(atlas: Atlas, tokens: np.ndarray, tokenizer, out: Path):
             "value": values.ravel(), "row": index.ravel() // T, "pos": index.ravel() % T,
         }))
     neurons, topk = pd.concat(neurons, ignore_index=True), pd.concat(topk, ignore_index=True)
+    boot = len(shards) >= 2
+    if boot:
+        groups = np.asarray(groups)
+        w = bootstrap_weights(groups, n_boot)
+        # [S] tokens per shard and [S, U] moments, units in the same order as `neurons`.
+        n = np.array([float(sh.acc[next(iter(sh.acc))]["moments"].n) for sh in shards])
+        stack = lambda f: np.stack([np.concatenate([f(sh.acc[name]["moments"]) for name in atlas.acc]) for sh in shards])
+        mean, m2 = stack(lambda m: m.mean.numpy()), stack(lambda m: m.m2.numpy())
+        n_pos = stack(lambda m: m.n_pos.double().numpy())
+        reps = pooled_moments(w, n, mean, m2, n_pos)
+        for col in ("mean", "std", "frac_pos"):
+            neurons[f"{col}_err"] = reps[col].std(0)
+        pd.DataFrame({
+            "shard": np.repeat(np.arange(len(shards)), mean.shape[1]), "file": np.repeat(groups, mean.shape[1]),
+            "hook": np.tile(neurons["hook"].to_numpy(), len(shards)), "unit": np.tile(neurons["unit"].to_numpy(), len(shards)),
+            "n": np.repeat(n, mean.shape[1]), "mean": mean.ravel(), "m2": m2.ravel(), "n_pos": n_pos.ravel(),
+        }).to_parquet(out / "shards.parquet", index=False)
     topk = topk[topk["row"] >= 0]  # unfilled slots, only possible with fewer than k tokens
     topk["token"], topk["context"] = contexts(tokens, tokenizer, topk["row"].to_numpy(), topk["pos"].to_numpy())
     neurons.to_parquet(out / "neurons.parquet", index=False)
@@ -530,12 +629,38 @@ def export(atlas: Atlas, tokens: np.ndarray, tokenizer, out: Path):
 
     resid = [name for name in atlas.acc if "cov" in atlas.acc[name]]
     resid.sort(key=hook_layer)
+    extra = {}
+    if boot:
+        # Total variance and effective dimension per layer: bootstrap errors, and each file on its own.
+        files = np.unique(groups)
+        keys = ["total_var_err", "pr_err"] + [f"{k}_file" for k in ("total_var", "pr", "total_var_err", "pr_err")]
+        extra = {k: [] for k in keys}
+        for name in resid:
+            cs = [sh.acc[name]["cov"] for sh in shards]
+            args = (np.array([float(c.n) for c in cs]), np.stack([c.mean.numpy() for c in cs]), np.stack([c.c.numpy() for c in cs]))
+            t, p = pooled_cov_summaries(w, *args)
+            extra["total_var_err"].append(t.std())
+            extra["pr_err"].append(p.std())
+            per_file = []
+            for f in files:
+                mask = (groups == f).astype(float)
+                t0, p0 = pooled_cov_summaries(mask[None], *args)
+                tb, pb = pooled_cov_summaries(w * mask, *args)  # resamples restricted to this file's shards
+                per_file.append((t0[0], p0[0], tb.std(), pb.std()))
+            for k, v in zip(keys[2:], np.array(per_file).T):
+                extra[k].append(v)
+        extra = {k: np.array(v) for k, v in extra.items()} | {"files": files}
+    covs = np.stack([atlas.acc[n]["cov"].cov.numpy() for n in resid])
+    tr = np.trace(covs, axis1=1, axis2=2)
     np.savez(
         out / "resid.npz",
         layer=np.array([hook_layer(n) for n in resid]),
         n=np.array([atlas.acc[n]["cov"].n for n in resid]),
         mean=np.stack([atlas.acc[n]["cov"].mean.numpy() for n in resid]),
-        cov=np.stack([atlas.acc[n]["cov"].cov.numpy() for n in resid]),
+        cov=covs,
+        total_var=tr,
+        pr=tr**2 / (covs**2).sum((1, 2)),
+        **extra,
     )
     first = next(iter(atlas.acc.values()))["hist"]
     np.savez(out / "histograms.npz", edges=first.edges.numpy(),
@@ -565,6 +690,12 @@ def load_tokenizer():
     return tokenizer
 
 
+def row_files(dir: Path) -> np.ndarray:
+    """OpenWebText file of each row; directories tokenized before multi-file support have one file."""
+    docs = np.load(dir / "docs.npy")
+    return docs[:, 0] if docs.shape[1] == 3 else np.zeros(len(docs), dtype=np.int64)
+
+
 def git_commit() -> str:
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True).strip()
@@ -579,10 +710,13 @@ def main(argv=None):
     s.add_argument("dir", type=Path)
     s.add_argument("--n-tokens", type=float, default=1e6)
     s.add_argument("--seq-len", type=int, default=128)
-    s.add_argument("--shard", type=int, default=0, help="which of the 80 OpenWebText Parquet files")
+    s.add_argument("--files", default="0,1", help="which of the 80 OpenWebText Parquet files, comma-separated; tokens are split evenly")
+    s.add_argument("--max-windows-per-doc", type=int, default=1, help="0 = every window of every document")
+    s.add_argument("--seed", type=int, default=0)
     s = sub.add_parser("run", help="accumulate statistics over a row range -> state-<start>-<stop>.pt")
     s.add_argument("dir", type=Path)
     s.add_argument("--rows", default=":", help="START:STOP row range (default: all)")
+    s.add_argument("--shards", type=int, help="run N row ranges (none straddling two files) in one process; overrides --rows")
     s.add_argument("--batch-size", type=int, default=64)
     s.add_argument("--k", type=int, default=20)
     s.add_argument("--hist-stride", type=int, default=4, help="histograms (quantiles) use every Nth token; 1 = all")
@@ -594,29 +728,42 @@ def main(argv=None):
     args.dir.mkdir(parents=True, exist_ok=True)
 
     if args.cmd == "tokenize":
+        if stale := sorted(args.dir.glob("state-*.pt")):
+            p.error(f"{args.dir} has {len(stale)} state file(s) from earlier tokens; use a new directory or delete them")
         t0 = time.time()
-        tokens, docs = tokenize(owt_texts(args.shard), load_tokenizer(), int(args.n_tokens), args.seq_len)
+        files = [int(f) for f in args.files.split(",")]
+        parts = [tokenize(owt_texts(f), load_tokenizer(), int(args.n_tokens) // len(files), args.seq_len,
+                          args.max_windows_per_doc or None, args.seed + f) for f in files]
+        tokens = np.concatenate([t for t, _ in parts])
+        docs = np.concatenate([np.column_stack([np.full(len(d), f), d]) for f, (_, d) in zip(files, parts)])
         np.save(args.dir / "tokens.npy", tokens)
         np.save(args.dir / "docs.npy", docs)
         manifest = {
-            "dataset": OWT_REPO, "shard": args.shard, "seq_len": args.seq_len, "n_rows": len(tokens),
-            "n_docs": int(docs[-1, 0]) + 1, "tokenizer": "gpt2", "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "dataset": OWT_REPO, "files": files, "rows_per_file": [len(t) for t, _ in parts], "seq_len": args.seq_len,
+            "n_rows": len(tokens), "n_docs": len(np.unique(docs[:, :2], axis=0)),
+            "max_windows_per_doc": args.max_windows_per_doc, "seed": args.seed, "tokenizer": "gpt2",
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         (args.dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         print(f"{tokens.shape} tokens from {manifest['n_docs']} docs in {time.time() - t0:.0f}s -> {args.dir}")
 
     elif args.cmd == "run":
         tokens = np.load(args.dir / "tokens.npy", mmap_mode="r")
-        start, stop = (int(x) if x else d for x, d in zip(args.rows.split(":"), (0, len(tokens))))
-        t0 = time.time()
-        atlas = run(load_model(args.device, args.backend), tokens, start, stop, args.batch_size, args.k, args.hist_stride, args.device)
-        dt = time.time() - t0
-        state = atlas.state() | {"rows": (start, stop), "model": "gpt2", "backend": args.backend,
-                                 "git_commit": git_commit(), "torch": str(torch.__version__), "seconds": dt}
-        path = args.dir / f"state-{start}-{stop}.pt"
-        torch.save(state, path)
-        print(f"{(stop - start) * (tokens.shape[1] - 1):,} tokens in {dt:.0f}s "
-              f"({(stop - start) * tokens.shape[1] / dt:,.0f} tok/s incl. BOS) -> {path}")
+        if args.shards:
+            ranges = shard_ranges(row_files(args.dir), args.shards)
+        else:
+            ranges = [tuple(int(x) if x else d for x, d in zip(args.rows.split(":"), (0, len(tokens))))]
+        model = load_model(args.device, args.backend)
+        for start, stop in ranges:
+            t0 = time.time()
+            atlas = run(model, tokens, start, stop, args.batch_size, args.k, args.hist_stride, args.device, progress=len(ranges) == 1)
+            dt = time.time() - t0
+            state = atlas.state() | {"rows": (start, stop), "model": "gpt2", "backend": args.backend,
+                                     "git_commit": git_commit(), "torch": str(torch.__version__), "seconds": dt}
+            path = args.dir / f"state-{start}-{stop}.pt"
+            torch.save(state, path)
+            print(f"{(stop - start) * (tokens.shape[1] - 1):,} tokens in {dt:.0f}s "
+                  f"({(stop - start) * tokens.shape[1] / dt:,.0f} tok/s incl. BOS) -> {path}")
 
     elif args.cmd == "export":
         paths = sorted(args.dir.glob("state-*.pt"))
@@ -626,11 +773,15 @@ def main(argv=None):
         ranges = sorted(s["rows"] for s in states)
         for (_, a), (b, _) in itertools.pairwise(ranges):
             assert a <= b, f"overlapping row ranges {ranges}: tokens would be double counted"
-        atlas = Atlas.from_state(states[0])
-        for s in states[1:]:
-            atlas.merge(Atlas.from_state(s))
+        states.sort(key=lambda s: s["rows"])
+        shards = [Atlas.from_state(s) for s in states]
+        atlas = Atlas.from_state(copy.deepcopy(states[0]))  # merge works in place: don't alter shard 0
+        for sh in shards[1:]:
+            atlas.merge(sh)
+        files = row_files(args.dir)
+        groups = [files[a] if files[a] == files[b - 1] else -1 for a, b in ranges]  # -1: a shard spanning files
         tokens = np.load(args.dir / "tokens.npy", mmap_mode="r")
-        export(atlas, tokens, load_tokenizer(), args.dir)
+        export(atlas, tokens, load_tokenizer(), args.dir, shards if len(shards) > 1 else (), groups)
         print(f"merged {len(paths)} state(s), {atlas.n_rows:,} rows, ranges {ranges} -> {args.dir}")
 
 
