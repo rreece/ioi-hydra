@@ -54,17 +54,22 @@ This study is a replication with quantitative extensions, not a new discovery. W
 | [Wang et al. 2022](https://arxiv.org/abs/2211.00593) | GPT-2 small, IOI | the circuit; backup name movers, found because knocking out the name movers did not break the task; negative name movers, which they speculate help the model "hedge" |
 | [McGrath et al. 2023](https://arxiv.org/abs/2307.15771) | factual recall, ablating whole attention layers | the Hydra effect: when one attention layer is ablated, another compensates; late MLPs "downregulate the maximum-likelihood token"; this occurs "even in language models trained without any form of dropout" |
 | [McDougall et al. 2023](https://arxiv.org/abs/2310.04625) | GPT-2 small, head 10.7 | copy suppression; "if an initial overconfident copier is ablated, then there is nothing to suppress"; copy suppression "explains 39% of the [self-repair] behavior in a narrow task" |
+| [Rushing & Nanda 2024](https://arxiv.org/abs/2402.15390) | single attention heads, resample-ablated on the training distribution (The Pile); Pythia, GPT-2, Llama-7B | self-repair is general across model families and sizes, but "imperfect" and varies "significantly across different prompts"; measured as the change in the correct token's logit minus the change in the head's direct effect; LayerNorm rescaling "only explains up to around 30% of the self-repair on average"; sparse neurons perform "Anti-Erasure"; IOI's backup heads and copy suppression are cited as known instances |
 
 **What is borrowed.** The circuit and its head roles come from Wang et al. The central measurement, direct versus
 total effect of an ablation with the gap read as compensation, comes from McGrath et al., applied here at the level of
 individual heads inside the IOI circuit rather than whole layers in a factual-recall setting. That the IOI circuit
 self-repairs (Wang et al.) and that 10.7 contributes by having nothing left to suppress (McDougall et al.) were both
-already known.
+already known. So is the generality of the effect: Rushing & Nanda measure self-repair for single heads across models
+and the full training distribution, with the same direct-minus-total definition (on one token's logit rather than a
+logit difference), and find a LayerNorm share of up to about 30%.
 
 **What this study adds.**
 1. A complete accounting of the repair with uncertainties: every logit assigned to a component (§5 waterfall), with
-   bootstrap CIs. The 45% attributed to 10.7 is consistent with McDougall et al.'s 39%, measured on a different
-   dataset with different accounting.
+   bootstrap CIs, and the natural direct effect measured by an explicit run with every mediator frozen. Where Rushing
+   & Nanda give distributional statistics over many heads and tokens, this is a per-component account of one circuit.
+   The 45% attributed to 10.7 is consistent with McDougall et al.'s 39%, measured on a different dataset with
+   different accounting.
 2. The counter-push from the later brake 11.10, which partly undoes the repair (§5).
 3. Systematics: the repair fraction across ablation methods, templates and name samples, with the bootstrap errors
    checked against seed-to-seed variation (§7).
@@ -258,6 +263,14 @@ direct effect those heads lose. What actually happens:
 | **direct** (naive prediction) = Σ<sub>ablated</sub> (DE<sub>clean</sub> − DE<sub>ablated</sub>) | **4.57** [4.29, 4.85] |
 | **total** (actual) = LD<sub>clean</sub> − LD<sub>ablated</sub> | **−0.15** [−0.33, 0.02] |
 | **repair fraction** = (direct − total) / direct | **1.03** [1.00, 1.07] |
+| **natural direct effect**, exact run: ablate with every other component frozen at its clean value | 4.57 [4.29, 4.84] |
+
+The last row checks the first. The naive prediction comes from direct-effect accounting, which divides by the
+ablated run's final-LayerNorm scale. Re-running the ablation with every other head's output, every MLP output and the
+final-LN scale held at their clean values, so that nothing can react, gives the same number to within 0.003 logits.
+The two agree because a mean-ablated name mover's direct effect is about zero, so the scale it is divided by hardly
+matters. The naive prediction is therefore the exact no-feedback counterfactual, not an approximation of it (see
+[causal mediation](#the-study-as-causal-mediation-analysis)).
 
 ![Change in direct effect](figures/hydra_delta_de.png)
 
@@ -340,8 +353,9 @@ the heads are removed.
 | **total** (red) | closed-loop response: feedback on | about 0 |
 | **repair fraction** | how well the feedback regulates | about 1.0: complete regulation |
 
-The brake releasing and the backups stepping up (§5) are the feedback. The blue bar counts only the name movers'
-direct path to the logits; the exact no-feedback prediction would freeze every downstream activation before ablating.
+The brake releasing and the backups stepping up (§5) are the feedback. The blue bar is the exact open-loop
+response: freezing every other activation at its clean value before ablating reproduces it to within 0.003 logits for
+all three methods (zero −4.54, mean −4.57, resample −4.56).
 
 | variation | repair fraction |
 |---|---|
@@ -412,7 +426,7 @@ removing it will misjudge the output stage.
 
 ### The study as causal mediation analysis
 
-The Hydra measurement is a mediation analysis in Pearl's sense (Pearl 2001, "Direct and Indirect Effects"). The
+The Hydra measurement is a mediation analysis in Pearl's sense ([Pearl 2001](https://arxiv.org/abs/1301.2300), "Direct and Indirect Effects"). The
 network is a deterministic structural causal model, the prompts are the population, and all effects are averaged
 over prompts:
 
@@ -452,22 +466,40 @@ $$\underbrace{Y(x', M(x')) - Y(x, M(x))}_{\text{total effect}} = \underbrace{Y(x
 
 | mediation term | in this study | change in LD |
 |---|---|---|
-| **total effect** | ablate the name movers and let everything react (§5) | +0.15 |
-| **natural direct effect** | ablate them with the mediators held at their clean values: the "direct" bar in §5 and §7 | ≈ −4.57 |
-| **natural indirect effect** | the change carried through the mediators: the repair, broken down by mediator in the §5 waterfall | ≈ +4.72 |
+| **total effect** | ablate the name movers and let everything react (§5) | +0.15 [−0.02, 0.33] |
+| **natural direct effect** | ablate them with every mediator (other heads, MLPs, final-LN scale) frozen at its clean value, run directly | −4.57 [−4.84, −4.29] |
+| **natural indirect effect** | total − direct: the change carried through the mediators, broken down by mediator in the §5 waterfall | +4.72 [4.42, 5.01] |
 
 Self-repair is a large natural indirect effect, through the copy-suppression and backup heads, that almost exactly
-cancels the natural direct effect. The direct effect here comes from the direct-effect accounting rather than from a
-run with the mediators explicitly frozen, so it approximates the natural direct effect (see
-[Limitations and next steps](#limitations-and-next-steps)).
+cancels the natural direct effect. The cross-world term $Y(x', M(x))$, which observational studies can never observe
+and must identify under strong assumptions, is here simply run: each prompt's clean activations are cached and patched
+back while the name movers are ablated. It agrees with the direct-effect accounting to within 0.003 logits (§5).
+
+The per-mediator split is by *last* component: each mediator is credited with the change in its own direct
+contribution, which includes its reaction to other mediators (11.10 reads the layer-10 heads). These terms add up
+exactly, but they are not Pearl's per-mediator indirect effects, which for interacting mediators do not add up and
+depend on order (§6).
 
 | interpretability tool | causal concept |
 |---|---|
 | activation patching | a do-intervention on an intermediate variable: $\mathrm{do}(M = \text{its value under another input})$ |
 | denoising vs ablation (sufficiency vs necessity) | analogous to Pearl's probabilities of sufficiency and necessity (an analogy, not identical definitions) |
-| path patching (Wang et al.) | path-specific effects (Avin, Shpitser & Pearl 2005); Wang et al. build on causal mediation analysis for language models (Vig et al. 2020) |
+| path patching (Wang et al.) | path-specific effects (Avin, Shpitser & Pearl 2005); Wang et al. build on causal mediation analysis for language models ([Vig et al. 2020](https://arxiv.org/abs/2004.12265)) |
 | head interactions (§6) | effect modification: one intervention's effect depends on the level of another |
 | order-dependent credit assignment (§6) | why mediation decompositions need a reference ordering, and why Shapley values are a principled alternative |
+
+**Further reading on causal mediation**, in a suggested reading order:
+
+| reference | why read it |
+|---|---|
+| [Vig et al. 2020](https://arxiv.org/abs/2004.12265), "Causal Mediation Analysis for Interpreting Neural NLP: The Case of Gender Bias" | the paper that brought Pearl's natural direct and indirect effects to transformer components (neurons, heads); the template for this section |
+| [Mueller et al. 2024](https://arxiv.org/abs/2408.01416), "The Quest for the Right Mediator: Surveying Mechanistic Interpretability Through the Lens of Causal Mediation Analysis" | survey that organizes interpretability methods by which mediator they target (neurons, heads, subspaces, features) and how they search for it |
+| [Pearl 2001](https://arxiv.org/abs/1301.2300), "Direct and Indirect Effects" (UAI 2001) | the primary source: defines the natural direct and indirect effects and the TE = NDE + NIE decomposition used above |
+| Pearl, Glymour & Jewell 2016, *Causal Inference in Statistics: A Primer* (Wiley), §4.5 | the gentlest textbook treatment of mediation and counterfactuals |
+| Avin, Shpitser & Pearl 2005, "Identifiability of Path-Specific Effects" (IJCAI 2005) | path-specific effects: the causal concept behind path patching, and the right tool for splitting the indirect effect by route |
+| [Geiger et al. 2023](https://arxiv.org/abs/2301.04709), "Causal Abstraction: A Theoretical Foundation for Mechanistic Interpretability" | the broader formal framework: when does a high-level causal story (like "the name movers copy the IO") faithfully abstract the network? |
+| [Heimersheim & Nanda 2024](https://arxiv.org/abs/2404.15255), "How to use and interpret activation patching" | practical guide to the interventions themselves: denoising vs noising, metrics, pitfalls |
+| [Rushing & Nanda 2024](https://arxiv.org/abs/2402.15390), "Explorations of Self-Repair in Language Models" (ICML 2024) | self-repair across models and heads, including the LayerNorm-scale contribution this study leaves partly unseparated |
 
 ### Sufficiency vs necessity
 
@@ -501,8 +533,6 @@ disagree is where the network's structure shows: redundancy for the name movers,
 - **LayerNorm rescaling is only partly separated out.** The final-LN scale drops about 6% under the ablation; the §5
   remainder is only −0.03, but freezing the scale would split the repair cleanly into head compensation and
   rescaling.
-- **The no-feedback prediction is approximated.** Freezing all downstream activations before ablating would give
-  the exact natural direct effect to compare with the direct effect (§7).
 - **The ABC corruption** confounds patching at name positions (§2) and defines the mean and resample references.
   Repeat §2–§3 and the ablations with an ABB → ABA corruption.
 - **Why the backups respond is not shown.** Path patching (as in Wang et al. Fig 4b) would show how 10.7 and the
