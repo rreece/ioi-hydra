@@ -1,6 +1,6 @@
 # GPT-2 Activation Atlas — Design Doc
 
-*Ryan Reece, 2026-10-22. Living version: [Claude Doc](https://claude.ai/artifact/4UKoy7XmiR5BfQKNthvETu).*
+*Ryan Reece, 2026-10-22, updated 2026-10-25. Living version: [Claude Doc](https://claude.ai/artifact/4UKoy7XmiR5BfQKNthvETu).*
 
 ## Summary
 
@@ -35,7 +35,7 @@ Activations are a pure function of (weights, tokens), so we keep tokens plus red
 1. **Store reductions and pointers, not tensors.** Dense activations for 1B tokens are about 20 TB for the residual stream alone and roughly 300 PB for every hook point. An exemplar is a `(row, pos)` pointer into `tokens.npy` (uint16, 2 bytes per token); rerunning one row costs milliseconds.
 2. **Reduce on the device.** Hooks reduce each batch on the GPU; only small summaries cross to the CPU. The host transfer, not FLOPs, is the bottleneck to avoid.
 3. **Every accumulator merges exactly.** Moments and covariance use Chan et al.'s parallel formulas in float64; histograms use fixed edges; top-k merges by re-selecting. Shard A plus shard B equals one pass over A + B, so scaling out is map-reduce.
-4. **Pin conventions and record provenance.** The model runs in TransformerLens compatibility mode (folded LayerNorm, centered writing weights), matching HookedTransformer and therefore the pretrained SAEs. Each state file records its row range, git commit, torch version and model.
+4. **Pin conventions and record provenance.** Activations follow TransformerLens's processed convention (folded LayerNorm, centered writing weights), matching HookedTransformer and therefore the pretrained SAEs, whichever backend computes them. Each state file records its row range, git commit, torch version and model.
 5. **Exclude known artefacts explicitly.** Position 0 (BOS) is an attention sink whose residual norm is orders of magnitude above the rest, so it is dropped from all statistics rather than left to dominate them.
 6. **Query with plain files.** Outputs are Parquet and npz, queried with DuckDB or pandas. There is no database server to run.
 
@@ -47,17 +47,21 @@ The pipeline is three commands over plain files: `tokenize` once, `run` per shar
 
 **Data model.** A *row* is one sequence the model processes independently: BOS plus 127 consecutive tokens from one document. A *pointer* is `(row, pos)`, stored as the integer `row × 128 + pos`; positions 1–127 are real tokens. Shards are row ranges, so a shard's state is self-describing and any set of non-overlapping shards merges into one atlas.
 
-**Hook points (stage 1).** MLP `hook_post` in all 12 layers (3072 units each) and the residual stream at 13 points: `hook_resid_pre` for layers 0–11 plus the final `hook_resid_post`. The forward pass stops after the last hook, skipping `ln_final` and the 50k-wide unembed (about 25% faster). Stage 2 adds an SAE encoder inside the same hooks and writes sparse `(row, pos, layer, feature, value)` events.
+**Hook points (stage 1).** MLP `hook_post` in all 12 layers (3072 units each) and the residual stream at 13 points: `hook_resid_pre` for layers 0–11 plus the final `hook_resid_post`. The forward pass stops after the last hook, so no layer past it runs. Stage 2 adds an SAE encoder inside the same hooks and writes sparse `(row, pos, layer, feature, value)` events.
+
+**Model backends.** The default backend, `HFGPT2`, is plain Hugging Face `GPT2Model` (no LM head, so no unembed) with PyTorch forward hooks, exposed under TransformerLens hook names. Compatibility mode changes only one thing the atlas reads: everything written to the residual stream has its per-token mean over d_model removed, because centering the writing weights is linear. `HFGPT2` applies that one subtraction. `TLGPT2`, the TransformerLens bridge, is kept as the reference, and `tests/test_backends.py` holds the two equal at every hook point. TransformerLens stays the tool for circuit work (patching, per-head outputs, direct logit attribution), where it saves real effort.
 
 ## Stage 1 status
 
-Stage 1 is built and validated on 1M tokens. The code lives in `python/atlas.py` (CLI `python -m atlas`), `scripts/run-atlas` and `tests/test_atlas.py`.
+Stage 1 is built and validated on 1M tokens, with both backends. The code lives in `python/atlas.py` (CLI `python -m atlas`, `--backend hf|tl`), `scripts/run-atlas`, `tests/test_atlas.py` and `tests/test_backends.py`.
 
 **Validation**
 
 | Check | Result |
 | --- | --- |
 | Merge exactness (unit tests: moments, covariance, top-k, histogram, state round trip, tokenizer) | 6 of 6 pass; split vs. whole agree to float32 rounding (~1e-7 relative) |
+| HF backend vs. TransformerLens bridge, per hook (7 hook types × layers 0, 5, 11, BOS included) | 21 of 21 agree within 2e-5 of the activation scale; raw HF residuals fail without centering, as they should |
+| Full 1M-token atlas, HF vs. TL backend | means, stds, quantiles agree to ~1e-5 relative; largest difference in any unit's max is 2e-4; 0.6% of top-k pointers swap among exact ties (identical left contexts) |
 | Pointers reproduce: recompute stored top-k entries from `(row, pos)` | 10 of 10 match to 5 decimals, layers 0, 9 and 11 |
 | Two-shard run merged by `export` | 7,813 rows from shards 0:4000 and 4000:7813 |
 | Residual stream behaves like known GPT-2 | variance grows ~5000× from layer 0 to the final residual; dim 447 is the dominant outlier from layer 8 on |
@@ -65,16 +69,18 @@ Stage 1 is built and validated on 1M tokens. The code lives in `python/atlas.py`
 
 **Measured cost (M4, MPS, 1M tokens)**
 
-| Quantity | Value |
-| --- | --- |
-| Forward pass alone, early-stopped before unembed | ~6,800 tok/s |
-| With all accumulators | ~3,200 tok/s |
-| Wall time for 1M tokens | ~5 min run + ~1 min tokenize + 9 s export |
-| State file per shard | 171 MB (histograms 97 MB, covariance 61 MB), independent of token count |
+| Quantity | TL bridge | Plain HF (default) |
+| --- | --- | --- |
+| Forward pass with hooks on all 25 points | ~5,300 tok/s | ~9,600 tok/s |
+| Full run, all accumulators | ~3,200 tok/s | ~3,900 tok/s |
+| Wall time for 1M tokens (run only) | ~5 min | ~4.3 min |
+| State file per shard | 171 MB (histograms 97 MB, covariance 61 MB), independent of token count | same |
+
+Tokenizing takes about 1 min and export 9 s with either backend.
 
 **Known limitations**
 
-- Accumulators halve throughput; not yet profiled. The histogram step is the likely cost.
+- The accumulators now cost more than the model: the forward pass is 1.8× faster on HF, but the full run only 22% faster. Not yet profiled; the histogram step is the likely cost.
 - 1M tokens come from only 909 documents, so exemplars cluster within documents.
 - Top-k keeps only the largest values; residual dimensions need bottom-k too.
 - Statistics cover positions 1–127 only. Behaviour that depends on long context is not seen.
