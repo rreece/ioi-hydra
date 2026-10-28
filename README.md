@@ -38,6 +38,6 @@ Note: TransformerLens 4.0 removed `HookedTransformer`. Load models with
 `TransformerBridge.boot_transformers("gpt2")`, then call `enable_compatibility_mode()`.
 
 
-2026/10/04      
-Ryan Reece
+Ryan Reece      
+2026/10/04
 
